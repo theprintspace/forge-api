@@ -179,36 +179,37 @@ def reset_password():
 @require_auth
 def get_today():
     today = datetime.now().strftime('%Y-%m-%d')
+    future = (datetime.now() + timedelta(days=14)).strftime('%Y-%m-%d')
     conn = get_conn()
     try:
         cur = conn.cursor()
 
+        # Single query: all roster entries from today to +14 days
         cur.execute("""
-            SELECT re.id, re.shift_date, re.start_time, re.end_time, re.booking_status,
-                   re.personnel_status, re.worked_in_dept, re.branch_id,
-                   re.clock_in_at, re.clock_out_at, re.break_start_at, re.break_minutes
-            FROM roster_entries re
-            WHERE re.personnel_id = %s AND re.shift_date = %s
-            AND re.booking_status IN ('booked', 'accepted')
-            LIMIT 1
-        """, (g.personnel_id, today))
-        today_shift = cur.fetchone()
+            SELECT id, shift_date, start_time, end_time, booking_status,
+                   personnel_status, worked_in_dept, branch_id,
+                   clock_in_at, clock_out_at, break_start_at, break_minutes
+            FROM roster_entries
+            WHERE personnel_id = %s
+            AND shift_date >= %s AND shift_date <= %s
+            AND booking_status IN ('booked', 'accepted', 'confirmed', 'offered')
+            ORDER BY shift_date
+        """, (g.personnel_id, today, future))
+        rows = cur.fetchall()
 
-        cur.execute("""
-            SELECT re.id, re.shift_date, re.start_time, re.end_time, re.booking_status,
-                   re.worked_in_dept
-            FROM roster_entries re
-            WHERE re.personnel_id = %s AND re.shift_date > %s AND re.shift_date <= %s
-            AND re.booking_status IN ('booked', 'accepted', 'offered')
-            ORDER BY re.shift_date LIMIT 10
-        """, (g.personnel_id, today, (datetime.now() + timedelta(days=14)).strftime('%Y-%m-%d')))
-        upcoming = cur.fetchall()
+        # Split results in Python
+        today_shift = None
+        upcoming = []
+        offers_count = 0
 
-        cur.execute("""
-            SELECT count(*) as cnt FROM roster_entries
-            WHERE personnel_id = %s AND booking_status = 'offered' AND shift_date >= %s
-        """, (g.personnel_id, today))
-        offers_count = cur.fetchone()['cnt']
+        for r in rows:
+            d = str(r['shift_date'])
+            if d == today and r['booking_status'] in ('booked', 'accepted', 'confirmed') and not today_shift:
+                today_shift = r
+            elif d > today:
+                upcoming.append(r)
+            if r['booking_status'] == 'offered' and d >= today:
+                offers_count += 1
 
         def serialize(s):
             if not s:
@@ -243,7 +244,7 @@ def get_today():
             "clock_status": clock_status,
             "clock_in_at": clock_in_at,
             "break_start_at": break_start_at,
-            "upcoming": [serialize(s) for s in upcoming],
+            "upcoming": [serialize(s) for s in upcoming[:10]],
             "pending_offers": offers_count,
         })
     finally:
