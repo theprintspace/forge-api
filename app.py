@@ -141,7 +141,8 @@ def get_today():
 
         cur.execute("""
             SELECT re.id, re.shift_date, re.start_time, re.end_time, re.booking_status,
-                   re.personnel_status, re.worked_in_dept, re.branch_id
+                   re.personnel_status, re.worked_in_dept, re.branch_id,
+                   re.clock_in_at, re.clock_out_at, re.break_start_at, re.break_minutes
             FROM roster_entries re
             WHERE re.personnel_id = %s AND re.shift_date = %s
             AND re.booking_status IN ('booked', 'accepted')
@@ -178,9 +179,26 @@ def get_today():
                 'location': 'Studio A, London',
             }
 
+        # Determine clock status
+        clock_status = "idle"
+        clock_in_at = None
+        break_start_at = None
+        if today_shift:
+            if today_shift.get('clock_in_at') and not today_shift.get('clock_out_at'):
+                clock_in_at = today_shift['clock_in_at'].isoformat() if today_shift['clock_in_at'] else None
+                if today_shift.get('break_start_at'):
+                    clock_status = "break"
+                    break_start_at = today_shift['break_start_at'].isoformat()
+                else:
+                    clock_status = "clocked"
+            elif today_shift.get('clock_out_at'):
+                clock_status = "completed"
+
         return jsonify({
             "today": serialize(today_shift),
-            "clock_status": "idle",
+            "clock_status": clock_status,
+            "clock_in_at": clock_in_at,
+            "break_start_at": break_start_at,
             "upcoming": [serialize(s) for s in upcoming],
             "pending_offers": offers_count,
         })
@@ -242,6 +260,234 @@ def set_availability():
     except Exception as e:
         conn.rollback()
         return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── CLOCK IN/OUT ──
+
+@app.route('/api/freelancer/clock/scan', methods=['POST', 'OPTIONS'])
+@require_auth
+def clock_scan():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    data = request.get_json()
+    qr_raw = (data or {}).get('qr_data', '')
+
+    # Dev bypass
+    if qr_raw in ('DEV_CLOCK_TOGGLE', 'SIMULATE_CLOCK_IN', 'SIMULATE_CLOCK_OUT'):
+        return _handle_clock_toggle(g.personnel_id, g.branch_id, 'Printing')
+
+    # Parse QR JSON
+    import json as _json
+    try:
+        qr = _json.loads(qr_raw)
+    except Exception:
+        return jsonify({"error": "Invalid QR code format"}), 400
+
+    qr_date = qr.get('date', '')
+    qr_branch = qr.get('branch_id', '')
+    qr_token = qr.get('token', '')
+    qr_dept = qr.get('department', 'Printing')
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    if qr_date != today:
+        return jsonify({"error": "QR code expired — this code is for " + qr_date}), 400
+
+    # Validate token against daily_qr_tokens
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT token FROM daily_qr_tokens
+            WHERE branch_id = %s AND token_date = %s
+        """, (qr_branch, today))
+        row = cur.fetchone()
+
+        if not row or row['token'] != qr_token:
+            return jsonify({"error": "Invalid QR code"}), 400
+
+        return _handle_clock_toggle(g.personnel_id, qr_branch, qr_dept)
+    finally:
+        conn.close()
+
+
+def _handle_clock_toggle(personnel_id, branch_id, department):
+    """Toggle clock in/out based on current state."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.utcnow()
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        # Find today's roster entry
+        cur.execute("""
+            SELECT id, clock_in_at, clock_out_at, break_minutes, start_time, end_time
+            FROM roster_entries
+            WHERE personnel_id = %s AND shift_date = %s
+            AND booking_status IN ('booked', 'accepted')
+            LIMIT 1
+        """, (personnel_id, today))
+        entry = cur.fetchone()
+
+        if not entry:
+            # No existing entry — create one and clock in
+            cur.execute("""
+                INSERT INTO roster_entries (personnel_id, shift_date, branch_id, booking_status,
+                    personnel_status, worked_in_dept, clock_in_at, start_time, end_time)
+                VALUES (%s, %s, %s, 'accepted', 'present', %s, %s, '09:00', '17:00')
+                ON CONFLICT (personnel_id, shift_date) DO UPDATE
+                SET clock_in_at = EXCLUDED.clock_in_at, personnel_status = 'present',
+                    worked_in_dept = EXCLUDED.worked_in_dept, booking_status = 'accepted'
+                RETURNING id
+            """, (personnel_id, today, branch_id, department, now))
+            conn.commit()
+            return jsonify({
+                "action": "clocked_in",
+                "department": department,
+                "time": now.strftime('%H:%M'),
+                "clock_in_at": now.isoformat(),
+            })
+
+        if not entry['clock_in_at']:
+            # Not clocked in yet — clock in
+            cur.execute("""
+                UPDATE roster_entries SET clock_in_at = %s, worked_in_dept = %s, personnel_status = 'present'
+                WHERE id = %s
+            """, (now, department, entry['id']))
+            conn.commit()
+            return jsonify({
+                "action": "clocked_in",
+                "department": department,
+                "time": now.strftime('%H:%M'),
+                "clock_in_at": now.isoformat(),
+            })
+
+        if entry['clock_out_at']:
+            # Already clocked out today
+            return jsonify({"error": "Already clocked out today"}), 400
+
+        # Clocked in — calculate hours and decide action
+        clock_in = entry['clock_in_at']
+        breaks = entry['break_minutes'] or 0
+        elapsed_seconds = (now - clock_in).total_seconds() - (breaks * 60)
+        hours_worked = elapsed_seconds / 3600
+
+        if hours_worked < 8:
+            # Early checkout warning
+            scheduled_end = str(entry['end_time'])[:5] if entry['end_time'] else '17:00'
+            return jsonify({
+                "action": "early_checkout",
+                "hours_worked": round(hours_worked, 2),
+                "scheduled_end": scheduled_end,
+                "clock_in_at": clock_in.isoformat(),
+            })
+        else:
+            # Normal clock out
+            cur.execute("""
+                UPDATE roster_entries SET clock_out_at = %s WHERE id = %s
+            """, (now, entry['id']))
+            conn.commit()
+            return jsonify({
+                "action": "clocked_out",
+                "hours_worked": round(hours_worked, 2),
+                "time": now.strftime('%H:%M'),
+            })
+    finally:
+        conn.close()
+
+
+@app.route('/api/freelancer/clock/force-out', methods=['POST', 'OPTIONS'])
+@require_auth
+def clock_force_out():
+    """Force clock out (used when user confirms early checkout)."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.utcnow()
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE roster_entries SET clock_out_at = %s
+            WHERE personnel_id = %s AND shift_date = %s AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
+        """, (now, g.personnel_id, today))
+        conn.commit()
+
+        if cur.rowcount == 0:
+            return jsonify({"error": "No active clock-in found"}), 400
+
+        return jsonify({"action": "clocked_out", "time": now.strftime('%H:%M')})
+    finally:
+        conn.close()
+
+
+@app.route('/api/freelancer/clock/break/start', methods=['POST', 'OPTIONS'])
+@require_auth
+def break_start():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.utcnow()
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE roster_entries SET break_start_at = %s
+            WHERE personnel_id = %s AND shift_date = %s AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
+        """, (now, g.personnel_id, today))
+        conn.commit()
+
+        if cur.rowcount == 0:
+            return jsonify({"error": "Not clocked in"}), 400
+
+        return jsonify({"break_started": now.strftime('%H:%M')})
+    finally:
+        conn.close()
+
+
+@app.route('/api/freelancer/clock/break/end', methods=['POST', 'OPTIONS'])
+@require_auth
+def break_end():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.utcnow()
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, break_start_at, break_minutes FROM roster_entries
+            WHERE personnel_id = %s AND shift_date = %s AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
+            LIMIT 1
+        """, (g.personnel_id, today))
+        entry = cur.fetchone()
+
+        if not entry or not entry['break_start_at']:
+            return jsonify({"error": "No active break"}), 400
+
+        break_duration = int((now - entry['break_start_at']).total_seconds() / 60)
+        total_breaks = (entry['break_minutes'] or 0) + break_duration
+
+        cur.execute("""
+            UPDATE roster_entries SET break_start_at = NULL, break_minutes = %s
+            WHERE id = %s
+        """, (total_breaks, entry['id']))
+        conn.commit()
+
+        return jsonify({
+            "break_ended": now.strftime('%H:%M'),
+            "break_minutes": break_duration,
+            "total_break_minutes": total_breaks,
+        })
     finally:
         conn.close()
 
