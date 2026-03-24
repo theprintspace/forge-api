@@ -765,7 +765,7 @@ def respond_to_offers():
         accepted = 0
         declined = 0
         for r in responses:
-            new_status = 'accepted' if r.get('accepted', False) else 'declined'
+            new_status = 'confirmed' if r.get('accepted', False) else 'declined'
             cur.execute("""
                 UPDATE roster_entries SET booking_status = %s, updated_at = now()
                 WHERE id = %s AND personnel_id = %s AND booking_status = 'offered'
