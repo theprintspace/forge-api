@@ -631,6 +631,51 @@ def request_shifts():
         release_conn(conn)
 
 
+# ── NOTIFICATIONS ──
+
+@app.route('/api/freelancer/me/notifications', methods=['GET', 'OPTIONS'])
+@require_auth
+def get_notifications():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, type, title, body, deep_link, created_at
+            FROM forge_notifications
+            WHERE personnel_id = %s AND read = false
+            ORDER BY created_at DESC LIMIT 20
+        """, (g.personnel_id,))
+        rows = cur.fetchall()
+        return jsonify({"notifications": [
+            {
+                "id": str(r['id']),
+                "type": r['type'],
+                "title": r['title'],
+                "body": r['body'],
+                "deep_link": r['deep_link'],
+                "created_at": r['created_at'].isoformat() if r['created_at'] else None,
+            } for r in rows
+        ]})
+    finally:
+        release_conn(conn)
+
+
+@app.route('/api/freelancer/me/notifications/<notif_id>/read', methods=['POST', 'OPTIONS'])
+@require_auth
+def mark_notification_read(notif_id):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE forge_notifications SET read = true
+            WHERE id = %s AND personnel_id = %s
+        """, (notif_id, g.personnel_id))
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        release_conn(conn)
+
+
 # ── FAILURE LOG (no auth — fire and forget from client) ──
 
 @app.route('/api/freelancer/log/failure', methods=['POST', 'OPTIONS'])
