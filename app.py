@@ -4,6 +4,7 @@ Connects to production Supabase. Deployed on Railway.
 """
 
 import os
+import json as _json
 import jwt
 import bcrypt
 import psycopg2
@@ -59,6 +60,31 @@ def require_auth(f):
             return jsonify({"error": "Invalid token"}), 401
         return f(*args, **kwargs)
     return decorated
+
+
+# ── Audit Helpers ──
+
+def _get_active_clock_entry(cur, personnel_id, today):
+    """Find active clock_entry for today (if exists)."""
+    cur.execute("""
+        SELECT id FROM clock_entries
+        WHERE personnel_id = %s AND shift_date = %s AND status = 'active'
+        LIMIT 1
+    """, (personnel_id, today))
+    row = cur.fetchone()
+    return row['id'] if row else None
+
+
+def _log_event(cur, clock_entry_id, roster_entry_id, personnel_id,
+               event_type, department=None, metadata=None):
+    """Insert into clock_events audit log."""
+    cur.execute("""
+        INSERT INTO clock_events
+            (clock_entry_id, roster_entry_id, personnel_id, event_type,
+             timestamp, department, metadata)
+        VALUES (%s, %s, %s, %s, now(), %s, %s)
+    """, (clock_entry_id, roster_entry_id, personnel_id, event_type,
+          department, _json.dumps(metadata or {})))
 
 
 # ── Health Check ──
@@ -280,7 +306,6 @@ def clock_scan():
         return _handle_clock_toggle(g.personnel_id, g.branch_id, 'Printing')
 
     # Parse QR JSON
-    import json as _json
     try:
         qr = _json.loads(qr_raw)
     except Exception:
@@ -318,7 +343,7 @@ def clock_scan():
 
 
 def _handle_clock_toggle(personnel_id, branch_id, department):
-    """Toggle clock in/out based on current state."""
+    """Toggle clock in/out based on current state. Writes to all 3 layers."""
     today = datetime.now().strftime('%Y-%m-%d')
     now = datetime.utcnow()
 
@@ -336,8 +361,8 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
         """, (personnel_id, today))
         entry = cur.fetchone()
 
+        # ── CLOCK IN: no roster entry exists ──
         if not entry:
-            # No existing entry — create one and clock in
             cur.execute("""
                 INSERT INTO roster_entries (personnel_id, shift_date, branch_id, booking_status,
                     personnel_status, worked_in_dept, clock_in_at, start_time, end_time)
@@ -347,6 +372,20 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                     worked_in_dept = EXCLUDED.worked_in_dept, booking_status = 'accepted'
                 RETURNING id
             """, (personnel_id, today, branch_id, department, now))
+            roster_id = cur.fetchone()['id']
+
+            # Layer 2: clock_entries
+            cur.execute("""
+                INSERT INTO clock_entries (personnel_id, roster_entry_id, shift_date,
+                    clock_in, department, branch_id, status)
+                VALUES (%s, %s, %s, %s, %s, %s, 'active')
+                RETURNING id
+            """, (personnel_id, roster_id, today, now, department, branch_id))
+            ce_id = cur.fetchone()['id']
+
+            # Layer 3: clock_events
+            _log_event(cur, ce_id, roster_id, personnel_id, 'clock_in', department)
+
             conn.commit()
             return jsonify({
                 "action": "clocked_in",
@@ -355,12 +394,25 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                 "clock_in_at": now.isoformat(),
             })
 
+        # ── CLOCK IN: roster entry exists, not clocked in yet ──
         if not entry['clock_in_at']:
-            # Not clocked in yet — clock in
             cur.execute("""
                 UPDATE roster_entries SET clock_in_at = %s, worked_in_dept = %s, personnel_status = 'present'
                 WHERE id = %s
             """, (now, department, entry['id']))
+
+            # Layer 2: clock_entries
+            cur.execute("""
+                INSERT INTO clock_entries (personnel_id, roster_entry_id, shift_date,
+                    clock_in, department, branch_id, status)
+                VALUES (%s, %s, %s, %s, %s, %s, 'active')
+                RETURNING id
+            """, (personnel_id, entry['id'], today, now, department, branch_id))
+            ce_id = cur.fetchone()['id']
+
+            # Layer 3: clock_events
+            _log_event(cur, ce_id, entry['id'], personnel_id, 'clock_in', department)
+
             conn.commit()
             return jsonify({
                 "action": "clocked_in",
@@ -373,14 +425,14 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             # Already clocked out today
             return jsonify({"error": "Already clocked out today"}), 400
 
-        # Clocked in — calculate hours and decide action
+        # ── CLOCK OUT: calculate hours and decide action ──
         clock_in = entry['clock_in_at']
         breaks = entry['break_minutes'] or 0
         elapsed_seconds = (now - clock_in).total_seconds() - (breaks * 60)
         hours_worked = elapsed_seconds / 3600
 
         if hours_worked < 8:
-            # Early checkout warning
+            # Early checkout warning — don't clock out yet, let frontend confirm
             scheduled_end = str(entry['end_time'])[:5] if entry['end_time'] else '17:00'
             return jsonify({
                 "action": "early_checkout",
@@ -389,10 +441,23 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                 "clock_in_at": clock_in.isoformat(),
             })
         else:
-            # Normal clock out
+            # Normal clock out — all 3 layers
             cur.execute("""
                 UPDATE roster_entries SET clock_out_at = %s WHERE id = %s
             """, (now, entry['id']))
+
+            ce_id = _get_active_clock_entry(cur, personnel_id, today)
+            if ce_id:
+                cur.execute("""
+                    UPDATE clock_entries SET clock_out = %s,
+                        worked_hours = %s, break_minutes = %s, status = 'pending_review'
+                    WHERE id = %s
+                """, (now, round(hours_worked, 2), breaks, ce_id))
+
+                _log_event(cur, ce_id, entry['id'], personnel_id, 'clock_out',
+                           metadata={"worked_hours": round(hours_worked, 2),
+                                     "break_minutes": breaks})
+
             conn.commit()
             return jsonify({
                 "action": "clocked_out",
@@ -432,11 +497,18 @@ def _handle_overtime_scan(personnel_id, branch_id, department):
         if hours_worked < 9:
             return jsonify({"error": "Not in overtime. You have worked {:.1f} hours — overtime starts at 9 hours.".format(hours_worked)}), 400
 
-        # Record the overtime scan
+        # Layer 1: roster_entries
         cur.execute("""
             UPDATE roster_entries SET last_overtime_scan = %s, worked_in_dept = %s
             WHERE id = %s
         """, (now, department, entry['id']))
+
+        # Layer 3: clock_events
+        ce_id = _get_active_clock_entry(cur, personnel_id, today)
+        if ce_id:
+            _log_event(cur, ce_id, entry['id'], personnel_id, 'overtime_scan',
+                       department, {"hours_worked": round(hours_worked, 2)})
+
         conn.commit()
 
         next_scan_time = now + timedelta(minutes=30)
@@ -463,15 +535,42 @@ def clock_force_out():
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            UPDATE roster_entries SET clock_out_at = %s
-            WHERE personnel_id = %s AND shift_date = %s AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
-        """, (now, g.personnel_id, today))
-        conn.commit()
 
-        if cur.rowcount == 0:
+        # Get entry for hours calculation
+        cur.execute("""
+            SELECT id, clock_in_at, break_minutes FROM roster_entries
+            WHERE personnel_id = %s AND shift_date = %s
+            AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
+            LIMIT 1
+        """, (g.personnel_id, today))
+        entry = cur.fetchone()
+
+        if not entry:
             return jsonify({"error": "No active clock-in found"}), 400
 
+        breaks = entry['break_minutes'] or 0
+        hours_worked = round(((now - entry['clock_in_at']).total_seconds() - breaks * 60) / 3600, 2)
+
+        # Layer 1: roster_entries
+        cur.execute("""
+            UPDATE roster_entries SET clock_out_at = %s WHERE id = %s
+        """, (now, entry['id']))
+
+        # Layer 2 + 3: clock_entries + clock_events
+        ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
+        if ce_id:
+            cur.execute("""
+                UPDATE clock_entries SET clock_out = %s,
+                    worked_hours = %s, break_minutes = %s, status = 'pending_review'
+                WHERE id = %s
+            """, (now, hours_worked, breaks, ce_id))
+
+            _log_event(cur, ce_id, entry['id'], g.personnel_id, 'force_out',
+                       metadata={"worked_hours": hours_worked,
+                                 "break_minutes": breaks,
+                                 "reason": "early_checkout"})
+
+        conn.commit()
         return jsonify({"action": "clocked_out", "time": now.strftime('%H:%M')})
     finally:
         conn.close()
@@ -489,16 +588,38 @@ def break_start():
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            UPDATE roster_entries SET break_start_at = %s
-            WHERE personnel_id = %s AND shift_date = %s AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
-        """, (now, g.personnel_id, today))
-        conn.commit()
 
-        if cur.rowcount == 0:
+        cur.execute("""
+            SELECT id FROM roster_entries
+            WHERE personnel_id = %s AND shift_date = %s
+            AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
+            LIMIT 1
+        """, (g.personnel_id, today))
+        entry = cur.fetchone()
+
+        if not entry:
             return jsonify({"error": "Not clocked in"}), 400
 
-        return jsonify({"break_started": now.strftime('%H:%M')})
+        # Layer 1: roster_entries
+        cur.execute("""
+            UPDATE roster_entries SET break_start_at = %s WHERE id = %s
+        """, (now, entry['id']))
+
+        # Layer 3: clock_events with break_number
+        ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
+        break_number = 1
+        if ce_id:
+            cur.execute("""
+                SELECT count(*) as cnt FROM clock_events
+                WHERE clock_entry_id = %s AND event_type = 'break_start'
+            """, (ce_id,))
+            break_number = (cur.fetchone()['cnt'] or 0) + 1
+
+            _log_event(cur, ce_id, entry['id'], g.personnel_id, 'break_start',
+                       metadata={"break_number": break_number})
+
+        conn.commit()
+        return jsonify({"break_started": now.strftime('%H:%M'), "break_number": break_number})
     finally:
         conn.close()
 
@@ -528,10 +649,27 @@ def break_end():
         break_duration = int((now - entry['break_start_at']).total_seconds() / 60)
         total_breaks = (entry['break_minutes'] or 0) + break_duration
 
+        # Layer 1: roster_entries
         cur.execute("""
             UPDATE roster_entries SET break_start_at = NULL, break_minutes = %s
             WHERE id = %s
         """, (total_breaks, entry['id']))
+
+        # Layer 3: clock_events with break_number + duration
+        ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
+        break_number = 1
+        if ce_id:
+            cur.execute("""
+                SELECT count(*) as cnt FROM clock_events
+                WHERE clock_entry_id = %s AND event_type = 'break_end'
+            """, (ce_id,))
+            break_number = (cur.fetchone()['cnt'] or 0) + 1
+
+            _log_event(cur, ce_id, entry['id'], g.personnel_id, 'break_end',
+                       metadata={"duration_minutes": break_duration,
+                                 "break_number": break_number,
+                                 "total_break_minutes": total_breaks})
+
         conn.commit()
 
         return jsonify({
