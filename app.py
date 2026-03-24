@@ -289,6 +289,7 @@ def clock_scan():
     qr_date = qr.get('date', '')
     qr_branch = qr.get('branch_id', '')
     qr_token = qr.get('token', '')
+    qr_type = qr.get('type', 'clock')  # backwards compat: no type = clock
     qr_dept = qr.get('department', 'Printing')
     today = datetime.now().strftime('%Y-%m-%d')
 
@@ -307,6 +308,9 @@ def clock_scan():
 
         if not row or row['token'] != qr_token:
             return jsonify({"error": "Invalid QR code"}), 400
+
+        if qr_type == 'overtime':
+            return _handle_overtime_scan(g.personnel_id, qr_branch, qr_dept)
 
         return _handle_clock_toggle(g.personnel_id, qr_branch, qr_dept)
     finally:
@@ -395,6 +399,53 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                 "hours_worked": round(hours_worked, 2),
                 "time": now.strftime('%H:%M'),
             })
+    finally:
+        conn.close()
+
+
+def _handle_overtime_scan(personnel_id, branch_id, department):
+    """Handle overtime department QR scan — freelancer must be clocked in and past 9 hours."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.utcnow()
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, clock_in_at, clock_out_at, break_minutes
+            FROM roster_entries
+            WHERE personnel_id = %s AND shift_date = %s
+            AND booking_status IN ('booked', 'accepted')
+            AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
+            LIMIT 1
+        """, (personnel_id, today))
+        entry = cur.fetchone()
+
+        if not entry:
+            return jsonify({"error": "Not clocked in"}), 400
+
+        clock_in = entry['clock_in_at']
+        breaks = entry['break_minutes'] or 0
+        elapsed_seconds = (now - clock_in).total_seconds() - (breaks * 60)
+        hours_worked = elapsed_seconds / 3600
+
+        if hours_worked < 9:
+            return jsonify({"error": "Not in overtime. You have worked {:.1f} hours — overtime starts at 9 hours.".format(hours_worked)}), 400
+
+        # Record the overtime scan
+        cur.execute("""
+            UPDATE roster_entries SET last_overtime_scan = %s, worked_in_dept = %s
+            WHERE id = %s
+        """, (now, department, entry['id']))
+        conn.commit()
+
+        next_scan_time = now + timedelta(minutes=30)
+        return jsonify({
+            "action": "overtime_confirmed",
+            "department": department,
+            "hours_worked": round(hours_worked, 2),
+            "next_scan_by": next_scan_time.strftime('%H:%M'),
+        })
     finally:
         conn.close()
 
