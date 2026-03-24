@@ -681,6 +681,38 @@ def break_end():
         conn.close()
 
 
+# ── REQUEST SHIFTS ──
+
+@app.route('/api/freelancer/me/request-shifts', methods=['POST', 'OPTIONS'])
+@require_auth
+def request_shifts():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        # Get freelancer name
+        cur.execute("SELECT full_name FROM personnel WHERE id = %s", (g.personnel_id,))
+        row = cur.fetchone()
+        name = row['full_name'] if row else 'A freelancer'
+
+        # Insert staff alert visible in BigOps
+        cur.execute("""
+            INSERT INTO staff_alerts (alert_type, personnel_id, branch_id, message, status, created_at)
+            VALUES ('shift_request', %s, %s, %s, 'unread', now())
+        """, (g.personnel_id, g.branch_id, f'{name} is requesting more shifts'))
+        conn.commit()
+
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"success": True})  # still return success to user
+    finally:
+        conn.close()
+
+
 # ── OFFERS ──
 
 @app.route('/api/freelancer/me/offers', methods=['GET', 'OPTIONS'])
