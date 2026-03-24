@@ -9,6 +9,7 @@ import jwt
 import bcrypt
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, g
@@ -26,18 +27,35 @@ JWT_SECRET = os.environ.get('FREELANCER_JWT_SECRET', 'forge-dev-secret-change-me
 JWT_EXPIRY_HOURS = 24
 
 
-# ── DB Connection ──
+# ── DB Connection Pool ──
+
+_pool = None
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        _pool = ThreadedConnectionPool(
+            2, 10,
+            host=os.environ.get("SUPABASE_DB_HOST", "db.vxhyfjqpmjsxvhyuxaar.supabase.co"),
+            port=int(os.environ.get("SUPABASE_DB_PORT", "5432")),
+            dbname="postgres",
+            user=os.environ.get("SUPABASE_DB_USER", "postgres"),
+            password=os.environ.get("SUPABASE_DB_PASSWORD", ""),
+            options="-c search_path=public",
+        )
+    return _pool
 
 def get_conn():
-    return psycopg2.connect(
-        host=os.environ.get("SUPABASE_DB_HOST", "db.vxhyfjqpmjsxvhyuxaar.supabase.co"),
-        port=int(os.environ.get("SUPABASE_DB_PORT", "5432")),
-        dbname="postgres",
-        user=os.environ.get("SUPABASE_DB_USER", "postgres"),
-        password=os.environ.get("SUPABASE_DB_PASSWORD", ""),
-        options="-c search_path=public",
-        cursor_factory=psycopg2.extras.RealDictCursor
-    )
+    conn = _get_pool().getconn()
+    conn.cursor_factory = psycopg2.extras.RealDictCursor
+    return conn
+
+def release_conn(conn):
+    try:
+        _get_pool().putconn(conn)
+    except Exception:
+        try: conn.close()
+        except Exception: pass
 
 
 # ── Auth Middleware ──
@@ -145,7 +163,7 @@ def login():
             }
         })
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.route('/api/freelancer/auth/reset-password', methods=['POST', 'OPTIONS'])
@@ -160,9 +178,6 @@ def reset_password():
 @app.route('/api/freelancer/me/today', methods=['GET', 'OPTIONS'])
 @require_auth
 def get_today():
-    if request.method == 'OPTIONS':
-        return '', 204
-
     today = datetime.now().strftime('%Y-%m-%d')
     conn = get_conn()
     try:
@@ -186,7 +201,7 @@ def get_today():
             WHERE re.personnel_id = %s AND re.shift_date > %s AND re.shift_date <= %s
             AND re.booking_status IN ('booked', 'accepted', 'offered')
             ORDER BY re.shift_date LIMIT 10
-        """, (g.personnel_id, today, (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')))
+        """, (g.personnel_id, today, (datetime.now() + timedelta(days=14)).strftime('%Y-%m-%d')))
         upcoming = cur.fetchall()
 
         cur.execute("""
@@ -232,7 +247,7 @@ def get_today():
             "pending_offers": offers_count,
         })
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 # ── AVAILABILITY ──
@@ -240,9 +255,6 @@ def get_today():
 @app.route('/api/freelancer/me/availability', methods=['GET', 'OPTIONS'])
 @require_auth
 def get_availability():
-    if request.method == 'OPTIONS':
-        return '', 204
-
     weeks = int(request.args.get('weeks', 2))
     start = datetime.now().strftime('%Y-%m-%d')
     end = (datetime.now() + timedelta(weeks=weeks)).strftime('%Y-%m-%d')
@@ -258,7 +270,7 @@ def get_availability():
         rows = cur.fetchall()
         return jsonify({"days": [{"date": str(r['date']), "available": r['status'] == 'available'} for r in rows]})
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.route('/api/freelancer/me/availability', methods=['POST'])
@@ -279,10 +291,10 @@ def set_availability():
         for d in days:
             status = 'available' if d.get('available') else 'unavailable'
             cur.execute("""
-                INSERT INTO freelancer_availability (personnel_id, date, status, window_start, window_end, available)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (personnel_id, date) DO UPDATE SET status = EXCLUDED.status, available = EXCLUDED.available
-            """, (g.personnel_id, d['date'], status, min_date, max_date, d.get('available', True)))
+                INSERT INTO freelancer_availability (personnel_id, date, status, window_start, window_end, submitted_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (personnel_id, date) DO UPDATE SET status = EXCLUDED.status, submitted_at = now()
+            """, (g.personnel_id, d['date'], status, min_date, max_date))
 
         conn.commit()
         return jsonify({"updated_count": len(days)})
@@ -290,7 +302,7 @@ def set_availability():
         conn.rollback()
         return jsonify({"error": str(e)}), 500
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 # ── CLOCK IN/OUT ──
@@ -298,9 +310,6 @@ def set_availability():
 @app.route('/api/freelancer/clock/scan', methods=['POST', 'OPTIONS'])
 @require_auth
 def clock_scan():
-    if request.method == 'OPTIONS':
-        return '', 204
-
     data = request.get_json()
     qr_raw = (data or {}).get('qr_data', '')
 
@@ -317,7 +326,7 @@ def clock_scan():
     qr_date = qr.get('date', '')
     qr_branch = qr.get('branch_id', '')
     qr_token = qr.get('token', '')
-    qr_type = qr.get('type', 'clock')  # backwards compat: no type = clock
+    qr_type = qr.get('type', 'clock')
     qr_dept = qr.get('department', 'Printing')
     today = datetime.now().strftime('%Y-%m-%d')
 
@@ -342,7 +351,7 @@ def clock_scan():
 
         return _handle_clock_toggle(g.personnel_id, qr_branch, qr_dept)
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 def _handle_clock_toggle(personnel_id, branch_id, department):
@@ -354,7 +363,6 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
     try:
         cur = conn.cursor()
 
-        # Find today's roster entry
         cur.execute("""
             SELECT id, clock_in_at, clock_out_at, break_minutes, start_time, end_time
             FROM roster_entries
@@ -377,7 +385,6 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             """, (personnel_id, today, branch_id, department, now))
             roster_id = cur.fetchone()['id']
 
-            # Layer 2: clock_entries
             cur.execute("""
                 INSERT INTO clock_entries (personnel_id, roster_entry_id, shift_date,
                     clock_in, department, branch_id, status)
@@ -386,16 +393,10 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             """, (personnel_id, roster_id, today, now, department, branch_id))
             ce_id = cur.fetchone()['id']
 
-            # Layer 3: clock_events
             _log_event(cur, ce_id, roster_id, personnel_id, 'clock_in', department)
-
             conn.commit()
-            return jsonify({
-                "action": "clocked_in",
-                "department": department,
-                "time": now.strftime('%H:%M'),
-                "clock_in_at": now.isoformat(),
-            })
+            return jsonify({"action": "clocked_in", "department": department,
+                            "time": now.strftime('%H:%M'), "clock_in_at": now.isoformat()})
 
         # ── CLOCK IN: roster entry exists, not clocked in yet ──
         if not entry['clock_in_at']:
@@ -404,7 +405,6 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                 WHERE id = %s
             """, (now, department, entry['id']))
 
-            # Layer 2: clock_entries
             cur.execute("""
                 INSERT INTO clock_entries (personnel_id, roster_entry_id, shift_date,
                     clock_in, department, branch_id, status)
@@ -413,42 +413,26 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             """, (personnel_id, entry['id'], today, now, department, branch_id))
             ce_id = cur.fetchone()['id']
 
-            # Layer 3: clock_events
             _log_event(cur, ce_id, entry['id'], personnel_id, 'clock_in', department)
-
             conn.commit()
-            return jsonify({
-                "action": "clocked_in",
-                "department": department,
-                "time": now.strftime('%H:%M'),
-                "clock_in_at": now.isoformat(),
-            })
+            return jsonify({"action": "clocked_in", "department": department,
+                            "time": now.strftime('%H:%M'), "clock_in_at": now.isoformat()})
 
         if entry['clock_out_at']:
-            # Already clocked out today
             return jsonify({"error": "Already clocked out today"}), 400
 
-        # ── CLOCK OUT: calculate hours and decide action ──
+        # ── CLOCK OUT: calculate hours ──
         clock_in = entry['clock_in_at']
         breaks = entry['break_minutes'] or 0
         elapsed_seconds = (now - clock_in).total_seconds() - (breaks * 60)
         hours_worked = elapsed_seconds / 3600
 
         if hours_worked < 8:
-            # Early checkout warning — don't clock out yet, let frontend confirm
             scheduled_end = str(entry['end_time'])[:5] if entry['end_time'] else '17:00'
-            return jsonify({
-                "action": "early_checkout",
-                "hours_worked": round(hours_worked, 2),
-                "scheduled_end": scheduled_end,
-                "clock_in_at": clock_in.isoformat(),
-            })
+            return jsonify({"action": "early_checkout", "hours_worked": round(hours_worked, 2),
+                            "scheduled_end": scheduled_end, "clock_in_at": clock_in.isoformat()})
         else:
-            # Normal clock out — all 3 layers
-            cur.execute("""
-                UPDATE roster_entries SET clock_out_at = %s WHERE id = %s
-            """, (now, entry['id']))
-
+            cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
             ce_id = _get_active_clock_entry(cur, personnel_id, today)
             if ce_id:
                 cur.execute("""
@@ -456,23 +440,17 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                         worked_hours = %s, break_minutes = %s, status = 'pending_review'
                     WHERE id = %s
                 """, (now, round(hours_worked, 2), breaks, ce_id))
-
                 _log_event(cur, ce_id, entry['id'], personnel_id, 'clock_out',
-                           metadata={"worked_hours": round(hours_worked, 2),
-                                     "break_minutes": breaks})
-
+                           metadata={"worked_hours": round(hours_worked, 2), "break_minutes": breaks})
             conn.commit()
-            return jsonify({
-                "action": "clocked_out",
-                "hours_worked": round(hours_worked, 2),
-                "time": now.strftime('%H:%M'),
-            })
+            return jsonify({"action": "clocked_out", "hours_worked": round(hours_worked, 2),
+                            "time": now.strftime('%H:%M')})
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 def _handle_overtime_scan(personnel_id, branch_id, department):
-    """Handle overtime department QR scan — freelancer must be clocked in and past 9 hours."""
+    """Handle overtime department QR scan."""
     today = datetime.now().strftime('%Y-%m-%d')
     now = datetime.utcnow()
 
@@ -492,54 +470,38 @@ def _handle_overtime_scan(personnel_id, branch_id, department):
         if not entry:
             return jsonify({"error": "Not clocked in"}), 400
 
-        clock_in = entry['clock_in_at']
         breaks = entry['break_minutes'] or 0
-        elapsed_seconds = (now - clock_in).total_seconds() - (breaks * 60)
-        hours_worked = elapsed_seconds / 3600
+        hours_worked = ((now - entry['clock_in_at']).total_seconds() - breaks * 60) / 3600
 
         if hours_worked < 9:
-            return jsonify({"error": "Not in overtime. You have worked {:.1f} hours — overtime starts at 9 hours.".format(hours_worked)}), 400
+            return jsonify({"error": "Not in overtime. {:.1f}h worked.".format(hours_worked)}), 400
 
-        # Layer 1: roster_entries
-        cur.execute("""
-            UPDATE roster_entries SET last_overtime_scan = %s, worked_in_dept = %s
-            WHERE id = %s
-        """, (now, department, entry['id']))
+        cur.execute("UPDATE roster_entries SET last_overtime_scan = %s, worked_in_dept = %s WHERE id = %s",
+                    (now, department, entry['id']))
 
-        # Layer 3: clock_events
         ce_id = _get_active_clock_entry(cur, personnel_id, today)
         if ce_id:
             _log_event(cur, ce_id, entry['id'], personnel_id, 'overtime_scan',
                        department, {"hours_worked": round(hours_worked, 2)})
 
         conn.commit()
-
-        next_scan_time = now + timedelta(minutes=30)
-        return jsonify({
-            "action": "overtime_confirmed",
-            "department": department,
-            "hours_worked": round(hours_worked, 2),
-            "next_scan_by": next_scan_time.strftime('%H:%M'),
-        })
+        next_scan = now + timedelta(minutes=30)
+        return jsonify({"action": "overtime_confirmed", "department": department,
+                        "hours_worked": round(hours_worked, 2), "next_scan_by": next_scan.strftime('%H:%M')})
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.route('/api/freelancer/clock/force-out', methods=['POST', 'OPTIONS'])
 @require_auth
 def clock_force_out():
-    """Force clock out (used when user confirms early checkout)."""
-    if request.method == 'OPTIONS':
-        return '', 204
-
+    """Force clock out (early checkout confirmed by user)."""
     today = datetime.now().strftime('%Y-%m-%d')
     now = datetime.utcnow()
 
     conn = get_conn()
     try:
         cur = conn.cursor()
-
-        # Get entry for hours calculation
         cur.execute("""
             SELECT id, clock_in_at, break_minutes FROM roster_entries
             WHERE personnel_id = %s AND shift_date = %s
@@ -554,12 +516,8 @@ def clock_force_out():
         breaks = entry['break_minutes'] or 0
         hours_worked = round(((now - entry['clock_in_at']).total_seconds() - breaks * 60) / 3600, 2)
 
-        # Layer 1: roster_entries
-        cur.execute("""
-            UPDATE roster_entries SET clock_out_at = %s WHERE id = %s
-        """, (now, entry['id']))
+        cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
 
-        # Layer 2 + 3: clock_entries + clock_events
         ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
         if ce_id:
             cur.execute("""
@@ -567,72 +525,52 @@ def clock_force_out():
                     worked_hours = %s, break_minutes = %s, status = 'pending_review'
                 WHERE id = %s
             """, (now, hours_worked, breaks, ce_id))
-
             _log_event(cur, ce_id, entry['id'], g.personnel_id, 'force_out',
-                       metadata={"worked_hours": hours_worked,
-                                 "break_minutes": breaks,
-                                 "reason": "early_checkout"})
+                       metadata={"worked_hours": hours_worked, "break_minutes": breaks, "reason": "early_checkout"})
 
         conn.commit()
         return jsonify({"action": "clocked_out", "time": now.strftime('%H:%M')})
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.route('/api/freelancer/clock/break/start', methods=['POST', 'OPTIONS'])
 @require_auth
 def break_start():
-    if request.method == 'OPTIONS':
-        return '', 204
-
     today = datetime.now().strftime('%Y-%m-%d')
     now = datetime.utcnow()
 
     conn = get_conn()
     try:
         cur = conn.cursor()
-
         cur.execute("""
             SELECT id FROM roster_entries
             WHERE personnel_id = %s AND shift_date = %s
-            AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
-            LIMIT 1
+            AND clock_in_at IS NOT NULL AND clock_out_at IS NULL LIMIT 1
         """, (g.personnel_id, today))
         entry = cur.fetchone()
 
         if not entry:
             return jsonify({"error": "Not clocked in"}), 400
 
-        # Layer 1: roster_entries
-        cur.execute("""
-            UPDATE roster_entries SET break_start_at = %s WHERE id = %s
-        """, (now, entry['id']))
+        cur.execute("UPDATE roster_entries SET break_start_at = %s WHERE id = %s", (now, entry['id']))
 
-        # Layer 3: clock_events with break_number
         ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
         break_number = 1
         if ce_id:
-            cur.execute("""
-                SELECT count(*) as cnt FROM clock_events
-                WHERE clock_entry_id = %s AND event_type = 'break_start'
-            """, (ce_id,))
+            cur.execute("SELECT count(*) as cnt FROM clock_events WHERE clock_entry_id = %s AND event_type = 'break_start'", (ce_id,))
             break_number = (cur.fetchone()['cnt'] or 0) + 1
-
-            _log_event(cur, ce_id, entry['id'], g.personnel_id, 'break_start',
-                       metadata={"break_number": break_number})
+            _log_event(cur, ce_id, entry['id'], g.personnel_id, 'break_start', metadata={"break_number": break_number})
 
         conn.commit()
         return jsonify({"break_started": now.strftime('%H:%M'), "break_number": break_number})
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.route('/api/freelancer/clock/break/end', methods=['POST', 'OPTIONS'])
 @require_auth
 def break_end():
-    if request.method == 'OPTIONS':
-        return '', 204
-
     today = datetime.now().strftime('%Y-%m-%d')
     now = datetime.utcnow()
 
@@ -641,8 +579,7 @@ def break_end():
         cur = conn.cursor()
         cur.execute("""
             SELECT id, break_start_at, break_minutes FROM roster_entries
-            WHERE personnel_id = %s AND shift_date = %s AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
-            LIMIT 1
+            WHERE personnel_id = %s AND shift_date = %s AND clock_in_at IS NOT NULL AND clock_out_at IS NULL LIMIT 1
         """, (g.personnel_id, today))
         entry = cur.fetchone()
 
@@ -652,36 +589,21 @@ def break_end():
         break_duration = int((now - entry['break_start_at']).total_seconds() / 60)
         total_breaks = (entry['break_minutes'] or 0) + break_duration
 
-        # Layer 1: roster_entries
-        cur.execute("""
-            UPDATE roster_entries SET break_start_at = NULL, break_minutes = %s
-            WHERE id = %s
-        """, (total_breaks, entry['id']))
+        cur.execute("UPDATE roster_entries SET break_start_at = NULL, break_minutes = %s WHERE id = %s",
+                    (total_breaks, entry['id']))
 
-        # Layer 3: clock_events with break_number + duration
         ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
         break_number = 1
         if ce_id:
-            cur.execute("""
-                SELECT count(*) as cnt FROM clock_events
-                WHERE clock_entry_id = %s AND event_type = 'break_end'
-            """, (ce_id,))
+            cur.execute("SELECT count(*) as cnt FROM clock_events WHERE clock_entry_id = %s AND event_type = 'break_end'", (ce_id,))
             break_number = (cur.fetchone()['cnt'] or 0) + 1
-
             _log_event(cur, ce_id, entry['id'], g.personnel_id, 'break_end',
-                       metadata={"duration_minutes": break_duration,
-                                 "break_number": break_number,
-                                 "total_break_minutes": total_breaks})
+                       metadata={"duration_minutes": break_duration, "break_number": break_number, "total_break_minutes": total_breaks})
 
         conn.commit()
-
-        return jsonify({
-            "break_ended": now.strftime('%H:%M'),
-            "break_minutes": break_duration,
-            "total_break_minutes": total_breaks,
-        })
+        return jsonify({"break_ended": now.strftime('%H:%M'), "break_minutes": break_duration, "total_break_minutes": total_breaks})
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 # ── REQUEST SHIFTS ──
@@ -689,31 +611,53 @@ def break_end():
 @app.route('/api/freelancer/me/request-shifts', methods=['POST', 'OPTIONS'])
 @require_auth
 def request_shifts():
-    if request.method == 'OPTIONS':
-        return '', 204
-
     conn = get_conn()
     try:
         cur = conn.cursor()
-
-        # Get freelancer name
         cur.execute("SELECT full_name FROM personnel WHERE id = %s", (g.personnel_id,))
         row = cur.fetchone()
         name = row['full_name'] if row else 'A freelancer'
 
-        # Insert staff alert visible in BigOps
         cur.execute("""
             INSERT INTO staff_alerts (alert_type, personnel_id, branch_id, message, status, created_at)
             VALUES ('shift_request', %s, %s, %s, 'unread', now())
         """, (g.personnel_id, g.branch_id, f'{name} is requesting more shifts'))
         conn.commit()
-
         return jsonify({"success": True})
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        return jsonify({"success": True})  # still return success to user
+        return jsonify({"success": True})
     finally:
-        conn.close()
+        release_conn(conn)
+
+
+# ── FAILURE LOG (no auth — fire and forget from client) ──
+
+@app.route('/api/freelancer/log/failure', methods=['POST', 'OPTIONS'])
+def log_failure():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    data = request.get_json() or {}
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO api_failure_logs (personnel_id, endpoint, payload, retries, first_attempted)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            data.get('user_id'),
+            data.get('endpoint'),
+            _json.dumps(data.get('body', {})),
+            data.get('retries', 0),
+            data.get('first_attempted'),
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        release_conn(conn)
+    return jsonify({"ok": True})
 
 
 # ── OFFERS ──
@@ -721,9 +665,6 @@ def request_shifts():
 @app.route('/api/freelancer/me/offers', methods=['GET', 'OPTIONS'])
 @require_auth
 def get_offers():
-    if request.method == 'OPTIONS':
-        return '', 204
-
     today = datetime.now().strftime('%Y-%m-%d')
     conn = get_conn()
     try:
@@ -761,15 +702,12 @@ def get_offers():
 
         return jsonify({"offers": offers})
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 @app.route('/api/freelancer/me/offers/respond', methods=['POST', 'OPTIONS'])
 @require_auth
 def respond_to_offers():
-    if request.method == 'OPTIONS':
-        return '', 204
-
     data = request.get_json()
     responses = (data or {}).get('responses', [])
     if not responses:
@@ -797,7 +735,7 @@ def respond_to_offers():
         conn.rollback()
         return jsonify({"error": str(e)}), 500
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 if __name__ == '__main__':
