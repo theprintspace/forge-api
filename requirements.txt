@@ -5,5 +5,3 @@ bcrypt==4.1.2
 psycopg2-binary==2.9.9
 gunicorn==22.0.0
 resend==2.0.0
-google-auth>=2.20.0
-requests>=2.28.0
