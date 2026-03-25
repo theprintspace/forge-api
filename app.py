@@ -264,12 +264,12 @@ def get_availability():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT date, status FROM freelancer_availability
+            SELECT date, status, reason FROM freelancer_availability
             WHERE personnel_id = %s AND date >= %s AND date < %s
             ORDER BY date
         """, (g.personnel_id, start, end))
         rows = cur.fetchall()
-        return jsonify({"days": [{"date": str(r['date']), "available": r['status'] == 'available'} for r in rows]})
+        return jsonify({"days": [{"date": str(r['date']), "available": r['status'] == 'available', "reason": r.get('reason')} for r in rows]})
     finally:
         release_conn(conn)
 
@@ -291,11 +291,12 @@ def set_availability():
 
         for d in days:
             status = 'available' if d.get('available') else 'unavailable'
+            reason = d.get('reason') or None
             cur.execute("""
-                INSERT INTO freelancer_availability (personnel_id, date, status, window_start, window_end, submitted_at)
-                VALUES (%s, %s, %s, %s, %s, now())
-                ON CONFLICT (personnel_id, date) DO UPDATE SET status = EXCLUDED.status, submitted_at = now()
-            """, (g.personnel_id, d['date'], status, min_date, max_date))
+                INSERT INTO freelancer_availability (personnel_id, date, status, window_start, window_end, submitted_at, reason)
+                VALUES (%s, %s, %s, %s, %s, now(), %s)
+                ON CONFLICT (personnel_id, date) DO UPDATE SET status = EXCLUDED.status, submitted_at = now(), reason = EXCLUDED.reason
+            """, (g.personnel_id, d['date'], status, min_date, max_date, reason))
 
         conn.commit()
         return jsonify({"updated_count": len(days)})
