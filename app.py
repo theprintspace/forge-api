@@ -7,6 +7,7 @@ import os
 import json as _json
 import jwt
 import bcrypt
+import resend
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
@@ -25,6 +26,16 @@ CORS(app, origins=[
 
 JWT_SECRET = os.environ.get('FREELANCER_JWT_SECRET', 'forge-dev-secret-change-me')
 JWT_EXPIRY_DAYS = 14
+
+resend.api_key = os.environ.get('RESEND_API_KEY', '')
+
+BRANCH_EMAILS = {
+    '4207e135-96a0-483c-82d3-29430973b2ca': 'productionusa@theprintspace.com',       # US
+    '1f7638fc-44d8-43a3-9a15-c9debfb19406': 'productionuk@theprintspace.co.uk',      # UK
+    '1a5f8dd8-1a09-4ff6-af90-1a93f565a01f': 'productionde@theprintspace.com',        # DE
+}
+
+FORGE_APP_URL = 'https://forge-app-sigma.vercel.app'
 
 
 # ── DB Connection Pool ──
@@ -177,6 +188,192 @@ def reset_password():
     if request.method == 'OPTIONS':
         return '', 204
     return jsonify({"message": "If that email exists, a reset link has been sent."})
+
+
+# ── INVITE SYSTEM ──
+
+@app.route('/api/freelancer/admin/invite', methods=['POST', 'OPTIONS'])
+def admin_invite():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    data = request.get_json() or {}
+    personnel_id = data.get('personnel_id')
+    if not personnel_id:
+        return jsonify({"error": "personnel_id required"}), 400
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, full_name, email, branch_id FROM personnel
+            WHERE id = %s AND is_active = true
+        """, (personnel_id,))
+        person = cur.fetchone()
+
+        if not person:
+            return jsonify({"error": "Personnel not found"}), 404
+        if not person['email']:
+            return jsonify({"error": "No email address on file"}), 400
+
+        # Create invite token
+        cur.execute("""
+            INSERT INTO forge_invite_tokens (personnel_id)
+            VALUES (%s)
+            RETURNING token
+        """, (personnel_id,))
+        token = str(cur.fetchone()['token'])
+        conn.commit()
+
+        # Build email
+        branch_email = BRANCH_EMAILS.get(str(person['branch_id'] or ''), 'productionuk@theprintspace.co.uk')
+        setup_url = f'{FORGE_APP_URL}/set-password?token={token}'
+        first_name = (person['full_name'] or '').split(' ')[0] or 'there'
+
+        html_body = f"""
+        <div style="font-family: 'Inter', Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 32px 20px;">
+            <div style="text-align: center; margin-bottom: 28px;">
+                <div style="display: inline-block; background: #1E2D18; border-radius: 12px; padding: 12px 16px;">
+                    <span style="color: #fff; font-size: 22px; font-weight: 700; font-family: 'Epilogue', sans-serif;">Forge</span>
+                </div>
+            </div>
+
+            <h1 style="font-size: 22px; font-weight: 700; color: #191C19; margin: 0 0 12px; text-align: center;">
+                Welcome to Forge, {first_name}
+            </h1>
+
+            <p style="font-size: 14px; color: #5A6E50; line-height: 1.6; margin: 0 0 24px; text-align: center;">
+                You've been invited to join Forge — the shift management app for theprintspace freelancers.
+                Accept shifts, clock in with QR, track your earnings, and manage your availability.
+            </p>
+
+            <div style="text-align: center; margin-bottom: 28px;">
+                <a href="{setup_url}" style="display: inline-block; background: #4A6838; color: #fff; text-decoration: none;
+                    padding: 14px 32px; border-radius: 12px; font-size: 15px; font-weight: 600;">
+                    Set up your account
+                </a>
+            </div>
+
+            <p style="font-size: 12px; color: #98A890; line-height: 1.5; text-align: center; margin: 0 0 8px;">
+                This link expires in 48 hours. If you didn't expect this email, you can safely ignore it.
+            </p>
+            <p style="font-size: 11px; color: #B8C4B0; text-align: center; margin: 0;">
+                theprintspace &middot; Forge
+            </p>
+        </div>
+        """
+
+        # Send via Resend
+        try:
+            resend.Emails.send({
+                "from": "Forge <noreply@theprintspace.com>",
+                "to": [person['email']],
+                "reply_to": branch_email,
+                "cc": [branch_email],
+                "subject": "Welcome to Forge | The new way to work at theprintspace",
+                "html": html_body,
+            })
+        except Exception as e:
+            return jsonify({"error": f"Email send failed: {str(e)}"}), 500
+
+        return jsonify({"success": True})
+    finally:
+        release_conn(conn)
+
+
+@app.route('/api/freelancer/auth/verify-invite', methods=['POST', 'OPTIONS'])
+def verify_invite():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    data = request.get_json() or {}
+    token = data.get('token', '')
+    if not token:
+        return jsonify({"error": "Token required"}), 400
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT it.personnel_id, p.full_name, p.email
+            FROM forge_invite_tokens it
+            JOIN personnel p ON p.id = it.personnel_id
+            WHERE it.token = %s AND it.used = false AND it.expires_at > now()
+        """, (token,))
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({"error": "Invalid or expired invite link"}), 400
+
+        return jsonify({
+            "personnel_id": str(row['personnel_id']),
+            "full_name": row['full_name'],
+            "email": row['email'],
+        })
+    finally:
+        release_conn(conn)
+
+
+@app.route('/api/freelancer/auth/set-password', methods=['POST', 'OPTIONS'])
+def set_password():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    data = request.get_json() or {}
+    token = data.get('token', '')
+    password = data.get('password', '')
+
+    if not token or not password:
+        return jsonify({"error": "Token and password required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        # Validate token
+        cur.execute("""
+            SELECT it.id, it.personnel_id, p.full_name, p.email, p.branch_id
+            FROM forge_invite_tokens it
+            JOIN personnel p ON p.id = it.personnel_id
+            WHERE it.token = %s AND it.used = false AND it.expires_at > now()
+        """, (token,))
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({"error": "Invalid or expired invite link"}), 400
+
+        # Hash password and update personnel
+        hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cur.execute("""
+            UPDATE personnel SET password_hash = %s, last_login_at = now()
+            WHERE id = %s
+        """, (hashed, row['personnel_id']))
+
+        # Mark token as used
+        cur.execute("UPDATE forge_invite_tokens SET used = true WHERE id = %s", (row['id'],))
+        conn.commit()
+
+        # Issue JWT
+        jwt_token = jwt.encode({
+            'personnel_id': str(row['personnel_id']),
+            'email': row['email'],
+            'branch_id': str(row['branch_id']) if row['branch_id'] else None,
+            'role': 'freelancer',
+            'exp': datetime.utcnow() + timedelta(days=JWT_EXPIRY_DAYS),
+        }, JWT_SECRET, algorithm='HS256')
+
+        return jsonify({
+            "token": jwt_token,
+            "user": {
+                "id": str(row['personnel_id']),
+                "name": row['full_name'],
+                "email": row['email'],
+            }
+        })
+    finally:
+        release_conn(conn)
 
 
 # ── TODAY ──
