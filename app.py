@@ -24,7 +24,7 @@ CORS(app, origins=[
 ], supports_credentials=True, allow_headers=["Authorization", "Content-Type"])
 
 JWT_SECRET = os.environ.get('FREELANCER_JWT_SECRET', 'forge-dev-secret-change-me')
-JWT_EXPIRY_HOURS = 24
+JWT_EXPIRY_DAYS = 14
 
 
 # ── DB Connection Pool ──
@@ -151,7 +151,7 @@ def login():
             'email': user['email'],
             'branch_id': str(user['branch_id']) if user['branch_id'] else None,
             'role': 'freelancer',
-            'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS),
+            'exp': datetime.utcnow() + timedelta(days=JWT_EXPIRY_DAYS),
         }, JWT_SECRET, algorithm='HS256')
 
         return jsonify({
