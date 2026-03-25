@@ -400,6 +400,12 @@ def get_today():
         """, (g.personnel_id, today, future))
         rows = cur.fetchall()
 
+        # Fetch pay info
+        cur.execute("SELECT pay_per_hour, currency FROM personnel WHERE id = %s", (g.personnel_id,))
+        pay_row = cur.fetchone()
+        pay_per_hour = float(pay_row['pay_per_hour'] or 0) if pay_row else 0
+        pay_currency = (pay_row['currency'] or 'GBP') if pay_row else 'GBP'
+
         # Split results in Python
         today_shift = None
         upcoming = []
@@ -449,6 +455,8 @@ def get_today():
             "break_start_at": break_start_at,
             "upcoming": [serialize(s) for s in upcoming[:10]],
             "pending_offers": offers_count,
+            "pay_per_hour": pay_per_hour,
+            "currency": pay_currency,
         })
     finally:
         release_conn(conn)
