@@ -641,16 +641,17 @@ def get_notifications():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, type, title, body, deep_link, created_at
+            SELECT id, type, title, body, deep_link, read, created_at
             FROM forge_notifications
-            WHERE personnel_id = %s AND read = false
-            ORDER BY created_at DESC LIMIT 20
+            WHERE personnel_id = %s AND created_at >= now() - interval '7 days'
+            ORDER BY created_at DESC LIMIT 30
         """, (g.personnel_id,))
         rows = cur.fetchall()
         return jsonify({"notifications": [
             {
                 "id": str(r['id']),
                 "type": r['type'],
+                "read": r['read'],
                 "title": r['title'],
                 "body": r['body'],
                 "deep_link": r['deep_link'],
