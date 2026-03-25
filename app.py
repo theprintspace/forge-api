@@ -14,13 +14,12 @@ from psycopg2.pool import ThreadedConnectionPool
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, g
+import requests as http_requests
 try:
-    import requests as http_requests
     from google.oauth2 import service_account as gsa
     from google.auth.transport.requests import Request as GAuthRequest
     _gauth_available = True
 except ImportError:
-    http_requests = None
     _gauth_available = False
 from flask_cors import CORS
 
