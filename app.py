@@ -1141,6 +1141,53 @@ def admin_push():
         release_conn(conn)
 
 
+# ── CLOCK EDIT REQUEST ──
+
+@app.route('/api/freelancer/me/earnings/<entry_id>/edit-request', methods=['POST', 'OPTIONS'])
+@require_auth
+def request_clock_edit(entry_id):
+    data = request.get_json() or {}
+    edit_in = data.get('edit_clock_in', '')
+    edit_out = data.get('edit_clock_out', '')
+    edit_break = data.get('edit_break_minutes')
+    notes = data.get('notes', '')
+
+    if not notes:
+        return jsonify({"error": "Reason is required"}), 400
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        # Validate ownership + not already requested
+        cur.execute("""
+            SELECT id, edit_requested FROM clock_entries
+            WHERE id = %s AND personnel_id = %s
+        """, (entry_id, g.personnel_id))
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({"error": "Entry not found"}), 404
+        if row['edit_requested']:
+            return jsonify({"error": "Edit already requested"}), 400
+
+        cur.execute("""
+            UPDATE clock_entries SET
+                edit_requested = true,
+                edit_clock_in = %s,
+                edit_clock_out = %s,
+                edit_break_minutes = %s,
+                notes = %s,
+                updated_at = now()
+            WHERE id = %s
+        """, (edit_in or None, edit_out or None, edit_break, notes, entry_id))
+        conn.commit()
+
+        return jsonify({"success": True})
+    finally:
+        release_conn(conn)
+
+
 # ── EARNINGS ──
 
 @app.route('/api/freelancer/me/earnings', methods=['GET', 'OPTIONS'])
@@ -1159,7 +1206,7 @@ def get_earnings():
         # Get clock entries
         cur.execute("""
             SELECT id, shift_date, clock_in, clock_out, break_minutes,
-                   worked_hours, overtime_hours, department, status
+                   worked_hours, overtime_hours, department, status, edit_requested
             FROM clock_entries
             WHERE personnel_id = %s
             ORDER BY shift_date DESC LIMIT 50
@@ -1197,6 +1244,7 @@ def get_earnings():
                 'gross_pay': gross,
                 'overtime_pay': ot_pay,
                 'total_pay': total,
+                'edit_requested': r['edit_requested'] or False,
             })
 
         return jsonify({
