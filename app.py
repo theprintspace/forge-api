@@ -372,10 +372,8 @@ def reset_password():
 
 # ── INVITE SYSTEM ──
 
-@app.route('/api/freelancer/admin/invite', methods=['POST', 'OPTIONS'])
+@app.route('/api/freelancer/admin/invite', methods=['POST'])
 def admin_invite():
-    if request.method == 'OPTIONS':
-        return '', 204
 
     data = request.get_json() or {}
     personnel_id = data.get('personnel_id')
