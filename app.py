@@ -133,7 +133,7 @@ def login():
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, full_name, email, branch_id, password_hash FROM personnel "
+            "SELECT id, full_name, email, branch_id, password_hash, pay_per_hour, currency FROM personnel "
             "WHERE email = %s AND personnel_type = 'freelancer' AND is_active = true",
             (email,)
         )
@@ -164,6 +164,8 @@ def login():
                 "id": str(user['id']),
                 "name": user['full_name'],
                 "email": user['email'],
+                "pay_per_hour": float(user['pay_per_hour'] or 0),
+                "currency": user['currency'] or 'GBP',
             }
         })
     finally:
