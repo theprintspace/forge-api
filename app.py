@@ -29,6 +29,7 @@ CORS(app, origins=[
     "https://forge.bigops.in",
     "https://bigops.vercel.app",
     "https://bigops.in",
+    "https://www.bigops.in",
     "http://localhost:3000",
     "http://localhost:5173",
     "http://localhost:8081",
