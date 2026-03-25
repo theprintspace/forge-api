@@ -1,4 +1,4 @@
-# clean build 2026-03-25
+# clean install 2026-03-25
 flask==3.1.0
 flask-cors==5.0.0
 PyJWT==2.8.0
@@ -6,3 +6,4 @@ bcrypt==4.1.2
 psycopg2-binary==2.9.9
 gunicorn==22.0.0
 resend==2.0.0
+google-auth==2.28.0
