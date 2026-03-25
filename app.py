@@ -113,15 +113,19 @@ _pool = None
 def _get_pool():
     global _pool
     if _pool is None:
-        _pool = ThreadedConnectionPool(
-            2, 10,
-            host=os.environ.get("SUPABASE_DB_HOST", "db.vxhyfjqpmjsxvhyuxaar.supabase.co"),
-            port=int(os.environ.get("SUPABASE_DB_PORT", "5432")),
-            dbname="postgres",
-            user=os.environ.get("SUPABASE_DB_USER", "postgres"),
-            password=os.environ.get("SUPABASE_DB_PASSWORD", ""),
-            options="-c search_path=public",
-        )
+        try:
+            _pool = ThreadedConnectionPool(
+                2, 10,
+                host=os.environ.get("SUPABASE_DB_HOST", "db.vxhyfjqpmjsxvhyuxaar.supabase.co"),
+                port=int(os.environ.get("SUPABASE_DB_PORT", "5432")),
+                dbname="postgres",
+                user=os.environ.get("SUPABASE_DB_USER", "postgres"),
+                password=os.environ.get("SUPABASE_DB_PASSWORD", ""),
+                options="-c search_path=public",
+            )
+        except Exception as e:
+            print(f"Pool init failed: {e}")
+            raise
     return _pool
 
 def get_conn():
