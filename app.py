@@ -14,12 +14,13 @@ from psycopg2.pool import ThreadedConnectionPool
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, g
+import requests as http_requests
 try:
-    import firebase_admin
-    from firebase_admin import credentials as fb_credentials, messaging as fcm_messaging
-    _firebase_available = True
+    from google.oauth2 import service_account as gsa
+    from google.auth.transport.requests import Request as GAuthRequest
+    _gauth_available = True
 except ImportError:
-    _firebase_available = False
+    _gauth_available = False
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -45,46 +46,63 @@ FORGE_APP_URL = 'https://forge-app-sigma.vercel.app'
 
 # ── Firebase Cloud Messaging ──
 
-_firebase_initialized = False
-def _init_firebase():
-    global _firebase_initialized
-    if _firebase_initialized or not _firebase_available:
-        return
-    pk = os.environ.get('FIREBASE_PRIVATE_KEY', '')
-    if not pk:
-        return
-    cred = fb_credentials.Certificate({
-        "type": "service_account",
-        "project_id": os.environ.get('FIREBASE_PROJECT_ID', ''),
-        "private_key": pk.replace('\\n', '\n'),
-        "client_email": os.environ.get('FIREBASE_CLIENT_EMAIL', ''),
-        "token_uri": "https://oauth2.googleapis.com/token",
-    })
-    firebase_admin.initialize_app(cred)
-    _firebase_initialized = True
+_fcm_creds = None
+
+def _get_fcm_access_token():
+    """Get OAuth2 access token for FCM HTTP v1 API."""
+    global _fcm_creds
+    if not _gauth_available:
+        return None
+    if _fcm_creds is None:
+        pk = os.environ.get('FIREBASE_PRIVATE_KEY', '')
+        if not pk:
+            return None
+        info = {
+            "type": "service_account",
+            "project_id": os.environ.get('FIREBASE_PROJECT_ID', ''),
+            "private_key": pk.replace('\\n', '\n'),
+            "client_email": os.environ.get('FIREBASE_CLIENT_EMAIL', ''),
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+        _fcm_creds = gsa.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/firebase.messaging"]
+        )
+    _fcm_creds.refresh(GAuthRequest())
+    return _fcm_creds.token
 
 def send_push(fcm_token, title, body, link='/'):
-    """Send a web push notification via FCM."""
-    if not fcm_token or not _firebase_available:
+    """Send a web push notification via FCM HTTP v1 API."""
+    if not fcm_token or not _gauth_available:
         return
-    _init_firebase()
-    if not _firebase_initialized:
+    access_token = _get_fcm_access_token()
+    if not access_token:
         return
-    message = fcm_messaging.Message(
-        webpush=fcm_messaging.WebpushConfig(
-            notification=fcm_messaging.WebpushNotification(
-                title=title, body=body, icon='/icon-192.svg'
-            ),
-            fcm_options=fcm_messaging.WebpushFCMOptions(
-                link=FORGE_APP_URL + link
-            )
-        ),
-        token=fcm_token
-    )
+    project_id = os.environ.get('FIREBASE_PROJECT_ID', '')
+    url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
+    payload = {
+        "message": {
+            "token": fcm_token,
+            "webpush": {
+                "notification": {
+                    "title": title,
+                    "body": body,
+                    "icon": "/icon-192.svg"
+                },
+                "fcm_options": {
+                    "link": FORGE_APP_URL + link
+                }
+            }
+        }
+    }
     try:
-        fcm_messaging.send(message)
+        resp = http_requests.post(url, json=payload, headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        })
+        if resp.status_code != 200:
+            print(f"FCM push failed ({resp.status_code}): {resp.text[:200]}")
     except Exception as e:
-        print(f"Push failed for token {fcm_token[:20]}...: {e}")
+        print(f"Push failed: {e}")
 
 
 # ── DB Connection Pool ──
