@@ -146,6 +146,10 @@ def login():
         if not bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
             return jsonify({"error": "Invalid email or password"}), 401
 
+        # Update last login timestamp
+        cur.execute("UPDATE personnel SET last_login_at = now() WHERE id = %s", (user['id'],))
+        conn.commit()
+
         token = jwt.encode({
             'personnel_id': str(user['id']),
             'email': user['email'],
