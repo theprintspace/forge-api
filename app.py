@@ -1141,6 +1141,74 @@ def admin_push():
         release_conn(conn)
 
 
+# ── EARNINGS ──
+
+@app.route('/api/freelancer/me/earnings', methods=['GET', 'OPTIONS'])
+@require_auth
+def get_earnings():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        # Get pay info
+        cur.execute("SELECT pay_per_hour, currency FROM personnel WHERE id = %s", (g.personnel_id,))
+        pay_row = cur.fetchone()
+        rate = float(pay_row['pay_per_hour'] or 0) if pay_row else 0
+        currency = (pay_row['currency'] or 'GBP') if pay_row else 'GBP'
+
+        # Get clock entries
+        cur.execute("""
+            SELECT id, shift_date, clock_in, clock_out, break_minutes,
+                   worked_hours, overtime_hours, department, status
+            FROM clock_entries
+            WHERE personnel_id = %s
+            ORDER BY shift_date DESC LIMIT 50
+        """, (g.personnel_id,))
+        rows = cur.fetchall()
+
+        total_earned = 0
+        pending = 0
+        entries = []
+
+        for r in rows:
+            wh = float(r['worked_hours'] or 0)
+            ot = float(r['overtime_hours'] or 0)
+            gross = round(wh * rate, 2)
+            ot_pay = round(ot * rate * 1.5, 2)
+            total = round(gross + ot_pay, 2)
+
+            if r['status'] == 'approved' or r['status'] == 'paid':
+                total_earned += total
+            elif r['status'] == 'pending_review':
+                pending += total
+
+            entries.append({
+                'id': str(r['id']),
+                'shift_date': str(r['shift_date']),
+                'clock_in': r['clock_in'].strftime('%H:%M') if r['clock_in'] else None,
+                'clock_out': r['clock_out'].strftime('%H:%M') if r['clock_out'] else None,
+                'break_minutes': r['break_minutes'] or 0,
+                'worked_hours': wh,
+                'overtime_hours': ot,
+                'department': r['department'],
+                'status': r['status'],
+                'pay_per_hour': rate,
+                'currency': currency,
+                'gross_pay': gross,
+                'overtime_pay': ot_pay,
+                'total_pay': total,
+            })
+
+        return jsonify({
+            'total_earned': round(total_earned, 2),
+            'pending': round(pending, 2),
+            'currency': currency,
+            'entries': entries,
+        })
+    finally:
+        release_conn(conn)
+
+
 # ── OFFERS ──
 
 @app.route('/api/freelancer/me/offers', methods=['GET', 'OPTIONS'])
