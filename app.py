@@ -14,8 +14,12 @@ from psycopg2.pool import ThreadedConnectionPool
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, g
-import firebase_admin
-from firebase_admin import credentials as fb_credentials, messaging as fcm_messaging
+try:
+    import firebase_admin
+    from firebase_admin import credentials as fb_credentials, messaging as fcm_messaging
+    _firebase_available = True
+except ImportError:
+    _firebase_available = False
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -44,7 +48,7 @@ FORGE_APP_URL = 'https://forge-app-sigma.vercel.app'
 _firebase_initialized = False
 def _init_firebase():
     global _firebase_initialized
-    if _firebase_initialized:
+    if _firebase_initialized or not _firebase_available:
         return
     pk = os.environ.get('FIREBASE_PRIVATE_KEY', '')
     if not pk:
@@ -61,7 +65,7 @@ def _init_firebase():
 
 def send_push(fcm_token, title, body, link='/'):
     """Send a web push notification via FCM."""
-    if not fcm_token:
+    if not fcm_token or not _firebase_available:
         return
     _init_firebase()
     if not _firebase_initialized:
