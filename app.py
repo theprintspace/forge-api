@@ -14,6 +14,8 @@ from psycopg2.pool import ThreadedConnectionPool
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, g
+import firebase_admin
+from firebase_admin import credentials as fb_credentials, messaging as fcm_messaging
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -36,6 +38,49 @@ BRANCH_EMAILS = {
 }
 
 FORGE_APP_URL = 'https://forge-app-sigma.vercel.app'
+
+# ── Firebase Cloud Messaging ──
+
+_firebase_initialized = False
+def _init_firebase():
+    global _firebase_initialized
+    if _firebase_initialized:
+        return
+    pk = os.environ.get('FIREBASE_PRIVATE_KEY', '')
+    if not pk:
+        return
+    cred = fb_credentials.Certificate({
+        "type": "service_account",
+        "project_id": os.environ.get('FIREBASE_PROJECT_ID', ''),
+        "private_key": pk.replace('\\n', '\n'),
+        "client_email": os.environ.get('FIREBASE_CLIENT_EMAIL', ''),
+        "token_uri": "https://oauth2.googleapis.com/token",
+    })
+    firebase_admin.initialize_app(cred)
+    _firebase_initialized = True
+
+def send_push(fcm_token, title, body, link='/'):
+    """Send a web push notification via FCM."""
+    if not fcm_token:
+        return
+    _init_firebase()
+    if not _firebase_initialized:
+        return
+    message = fcm_messaging.Message(
+        webpush=fcm_messaging.WebpushConfig(
+            notification=fcm_messaging.WebpushNotification(
+                title=title, body=body, icon='/icon-192.svg'
+            ),
+            fcm_options=fcm_messaging.WebpushFCMOptions(
+                link=FORGE_APP_URL + link
+            )
+        ),
+        token=fcm_token
+    )
+    try:
+        fcm_messaging.send(message)
+    except Exception as e:
+        print(f"Push failed for token {fcm_token[:20]}...: {e}")
 
 
 # ── DB Connection Pool ──
@@ -917,6 +962,55 @@ def log_failure():
     finally:
         release_conn(conn)
     return jsonify({"ok": True})
+
+
+# ── FCM TOKEN + PUSH ──
+
+@app.route('/api/freelancer/me/fcm-token', methods=['POST', 'OPTIONS'])
+@require_auth
+def save_fcm_token():
+    data = request.get_json() or {}
+    token = data.get('token', '')
+    if not token:
+        return jsonify({"error": "Token required"}), 400
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE personnel SET fcm_token = %s, fcm_token_updated_at = now()
+            WHERE id = %s
+        """, (token, g.personnel_id))
+        conn.commit()
+        return jsonify({"success": True})
+    finally:
+        release_conn(conn)
+
+
+@app.route('/api/freelancer/admin/push', methods=['POST', 'OPTIONS'])
+def admin_push():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    data = request.get_json() or {}
+    personnel_id = data.get('personnel_id')
+    title = data.get('title', 'Forge')
+    body = data.get('body', '')
+    link = data.get('link', '/')
+
+    if not personnel_id:
+        return jsonify({"error": "personnel_id required"}), 400
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT fcm_token FROM personnel WHERE id = %s", (personnel_id,))
+        row = cur.fetchone()
+        if row and row['fcm_token']:
+            send_push(row['fcm_token'], title, body, link)
+        return jsonify({"success": True})
+    finally:
+        release_conn(conn)
 
 
 # ── OFFERS ──
