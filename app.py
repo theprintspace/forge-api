@@ -171,6 +171,112 @@ def health():
     return jsonify({"service": "forge-api", "status": "ok", "time": datetime.utcnow().isoformat()})
 
 
+# ── CRON: Availability Reminder ──
+
+@app.route('/cron/availability-reminder', methods=['GET'])
+def cron_availability_reminder():
+    """Daily cron — sends availability reminder emails 3 days before next fortnightly window."""
+    import math
+    from datetime import date
+
+    today = date.today()
+    base = date(2026, 3, 23)  # Known Monday window start
+    days_since = (today - base).days
+    if days_since < 0:
+        return jsonify({"status": "skipped", "reason": "before base date"})
+
+    next_window = base + timedelta(days=math.ceil(days_since / 14) * 14)
+    gap = (next_window - today).days
+
+    if gap != 3:
+        return jsonify({"status": "skipped", "reason": f"{gap} days until next window (need 3)", "next_window": str(next_window)})
+
+    window_start = str(next_window)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        # Get all active freelancers with email, grouped by branch
+        cur.execute("""
+            SELECT id, full_name, email, branch_id FROM personnel
+            WHERE is_active = true AND email IS NOT NULL AND personnel_type = 'freelancer'
+        """)
+        personnel = cur.fetchall()
+
+        # Get template per branch
+        cur.execute("""
+            SELECT branch_id, setting_value FROM roster_settings
+            WHERE setting_key = 'email_template_availability_reminder'
+        """)
+        templates = {str(r['branch_id']): r['setting_value'] for r in cur.fetchall()}
+
+        sent = 0
+        skipped = 0
+
+        for person in personnel:
+            pid = str(person['id'])
+            bid = str(person['branch_id'] or '')
+
+            # Skip if already submitted availability for this window
+            cur.execute("""
+                SELECT count(*) as cnt FROM freelancer_availability
+                WHERE personnel_id = %s AND date >= %s
+            """, (pid, window_start))
+            if cur.fetchone()['cnt'] > 0:
+                skipped += 1
+                continue
+
+            template = templates.get(bid)
+            if not template:
+                skipped += 1
+                continue
+
+            subject = (template.get('subject', 'Action Required: Your Availability')
+                       .replace('[name]', (person['full_name'] or '').split(' ')[0]))
+            body_text = (template.get('body', '')
+                         .replace('[name]', (person['full_name'] or '').split(' ')[0]))
+            cta_text = template.get('cta_text', 'Update Availability')
+
+            branch_email = BRANCH_EMAILS.get(bid, 'productionuk@theprintspace.co.uk')
+
+            html_body = f"""
+            <div style="font-family:'Inter',Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px 20px;">
+                <div style="text-align:center;margin-bottom:28px;">
+                    <div style="display:inline-block;background:#1E2D18;border-radius:12px;padding:12px 16px;">
+                        <span style="color:#fff;font-size:22px;font-weight:700;">Forge</span>
+                    </div>
+                </div>
+                <div style="font-size:14px;color:#5A6E50;line-height:1.6;white-space:pre-line;margin-bottom:24px;">
+                    {body_text}
+                </div>
+                <div style="text-align:center;margin-bottom:28px;">
+                    <a href="{FORGE_APP_URL}/availability" style="display:inline-block;background:#4A6838;color:#fff;
+                        text-decoration:none;padding:14px 32px;border-radius:12px;font-size:15px;font-weight:600;">
+                        {cta_text}
+                    </a>
+                </div>
+                <p style="font-size:11px;color:#B8C4B0;text-align:center;">theprintspace &middot; Forge</p>
+            </div>
+            """
+
+            try:
+                resend.Emails.send({
+                    "from": "Forge <noreply@theprintspace.com>",
+                    "to": [person['email']],
+                    "reply_to": branch_email,
+                    "subject": subject,
+                    "html": html_body,
+                })
+                sent += 1
+            except Exception as e:
+                print(f"Availability reminder email failed for {person['email']}: {e}")
+                skipped += 1
+
+        return jsonify({"status": "sent", "sent": sent, "skipped": skipped, "next_window": window_start})
+    finally:
+        release_conn(conn)
+
+
 # ── AUTH ──
 
 @app.route('/api/freelancer/auth/login', methods=['POST', 'OPTIONS'])
