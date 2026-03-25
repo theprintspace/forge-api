@@ -27,8 +27,11 @@ app = Flask(__name__)
 CORS(app, origins=[
     "https://forge-app-sigma.vercel.app",
     "https://forge.bigops.in",
+    "https://bigops.vercel.app",
+    "https://bigops.in",
     "http://localhost:3000",
     "http://localhost:5173",
+    "http://localhost:8081",
 ], supports_credentials=True, allow_headers=["Authorization", "Content-Type"])
 
 JWT_SECRET = os.environ.get('FREELANCER_JWT_SECRET', 'forge-dev-secret-change-me')
