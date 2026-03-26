@@ -22,6 +22,7 @@ try:
 except ImportError:
     _gauth_available = False
 from flask_cors import CORS
+import zoneinfo
 
 app = Flask(__name__)
 CORS(app, origins=[
@@ -45,6 +46,16 @@ BRANCH_EMAILS = {
     '1f7638fc-44d8-43a3-9a15-c9debfb19406': 'productionuk@theprintspace.co.uk',      # UK
     '1a5f8dd8-1a09-4ff6-af90-1a93f565a01f': 'productionde@theprintspace.com',        # DE
 }
+
+BRANCH_TIMEZONES = {
+    '4207e135-96a0-483c-82d3-29430973b2ca': 'America/New_York',
+    '1f7638fc-44d8-43a3-9a15-c9debfb19406': 'Europe/London',
+    '1a5f8dd8-1a09-4ff6-af90-1a93f565a01f': 'Europe/Berlin',
+}
+
+def branch_today(branch_id):
+    tz_name = BRANCH_TIMEZONES.get(str(branch_id or ''), 'Europe/London')
+    return datetime.now(zoneinfo.ZoneInfo(tz_name)).strftime('%Y-%m-%d')
 
 FORGE_APP_URL = 'https://forge-app-sigma.vercel.app'
 
@@ -560,8 +571,8 @@ def set_password():
 @app.route('/api/freelancer/me/today', methods=['GET', 'OPTIONS'])
 @require_auth
 def get_today():
-    today = datetime.now().strftime('%Y-%m-%d')
-    future = (datetime.now() + timedelta(days=14)).strftime('%Y-%m-%d')
+    today = branch_today(getattr(g, 'branch_id', None))
+    future = (datetime.now(zoneinfo.ZoneInfo(BRANCH_TIMEZONES.get(str(getattr(g, 'branch_id', None) or ''), 'Europe/London'))) + timedelta(days=14)).strftime('%Y-%m-%d')
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -647,8 +658,8 @@ def get_today():
 @require_auth
 def get_availability():
     weeks = int(request.args.get('weeks', 2))
-    start = datetime.now().strftime('%Y-%m-%d')
-    end = (datetime.now() + timedelta(weeks=weeks)).strftime('%Y-%m-%d')
+    start = branch_today(getattr(g, 'branch_id', None))
+    end = (datetime.now(zoneinfo.ZoneInfo(BRANCH_TIMEZONES.get(str(getattr(g, 'branch_id', None) or ''), 'Europe/London'))) + timedelta(weeks=weeks)).strftime('%Y-%m-%d')
 
     conn = get_conn()
     try:
@@ -720,7 +731,7 @@ def clock_scan():
     qr_token = qr.get('token', '')
     qr_type = qr.get('type', 'clock')
     qr_dept = qr.get('department', 'Printing')
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = branch_today(getattr(g, 'branch_id', None))
 
     if qr_date != today:
         return jsonify({"error": "QR code expired — this code is for " + qr_date}), 400
@@ -748,7 +759,7 @@ def clock_scan():
 
 def _handle_clock_toggle(personnel_id, branch_id, department):
     """Toggle clock in/out based on current state. Writes to all 3 layers."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = branch_today(getattr(g, 'branch_id', None))
     now = datetime.utcnow()
 
     conn = get_conn()
@@ -843,7 +854,7 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
 
 def _handle_overtime_scan(personnel_id, branch_id, department):
     """Handle overtime department QR scan."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = branch_today(getattr(g, 'branch_id', None))
     now = datetime.utcnow()
 
     conn = get_conn()
@@ -888,7 +899,7 @@ def _handle_overtime_scan(personnel_id, branch_id, department):
 @require_auth
 def clock_force_out():
     """Force clock out (early checkout confirmed by user)."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = branch_today(getattr(g, 'branch_id', None))
     now = datetime.utcnow()
 
     conn = get_conn()
@@ -929,7 +940,7 @@ def clock_force_out():
 @app.route('/api/freelancer/clock/break/start', methods=['POST', 'OPTIONS'])
 @require_auth
 def break_start():
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = branch_today(getattr(g, 'branch_id', None))
     now = datetime.utcnow()
 
     conn = get_conn()
@@ -963,7 +974,7 @@ def break_start():
 @app.route('/api/freelancer/clock/break/end', methods=['POST', 'OPTIONS'])
 @require_auth
 def break_end():
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = branch_today(getattr(g, 'branch_id', None))
     now = datetime.utcnow()
 
     conn = get_conn()
@@ -1268,7 +1279,7 @@ def get_earnings():
 @app.route('/api/freelancer/me/offers', methods=['GET', 'OPTIONS'])
 @require_auth
 def get_offers():
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = branch_today(getattr(g, 'branch_id', None))
     conn = get_conn()
     try:
         cur = conn.cursor()
