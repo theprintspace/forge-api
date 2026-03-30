@@ -58,6 +58,18 @@ def branch_today(branch_id):
     return datetime.now(zoneinfo.ZoneInfo(tz_name)).strftime('%Y-%m-%d')
 
 FORGE_APP_URL = 'https://forge-app-sigma.vercel.app'
+def get_default_shift_hours(cur, branch_id):
+    """Get default shift start/end from roster_settings for this branch."""
+    cur.execute("""
+        SELECT setting_value FROM roster_settings
+        WHERE setting_key = 'default_shift_hours' AND branch_id = %s
+    """, (branch_id,))
+    row = cur.fetchone()
+    if row and row['setting_value']:
+        val = row['setting_value'] if isinstance(row['setting_value'], dict) else _json.loads(row['setting_value'])
+        return val.get('start', '09:00'), val.get('end', '17:00')
+    return '09:00', '17:00'
+
 
 # ── Firebase Cloud Messaging ──
 
@@ -620,7 +632,6 @@ def get_today():
                 'end': str(s['end_time'])[:5] if s['end_time'] else '17:00',
                 'status': s['booking_status'],
                 'dept': s.get('worked_in_dept') or 'Printing',
-                'location': 'Studio A, London',
             }
 
         # Determine clock status
@@ -780,12 +791,13 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             cur.execute("""
                 INSERT INTO roster_entries (personnel_id, shift_date, branch_id, booking_status,
                     personnel_status, worked_in_dept, clock_in_at, start_time, end_time)
-                VALUES (%s, %s, %s, 'accepted', 'present', %s, %s, '09:00', '17:00')
+                VALUES (%s, %s, %s, 'accepted', 'present', %s, %s, %s, %s)
                 ON CONFLICT (personnel_id, shift_date) DO UPDATE
                 SET clock_in_at = EXCLUDED.clock_in_at, personnel_status = 'present',
                     worked_in_dept = EXCLUDED.worked_in_dept, booking_status = 'accepted'
                 RETURNING id
-            """, (personnel_id, today, branch_id, department, now))
+            shift_start, shift_end = get_default_shift_hours(cur, branch_id)
+            """, (personnel_id, today, branch_id, department, now, shift_start, shift_end))
             roster_id = cur.fetchone()['id']
 
             cur.execute("""
@@ -1309,7 +1321,6 @@ def get_offers():
                 'end': str(r['end_time'])[:5] if r['end_time'] else '17:00',
                 'status': r['booking_status'],
                 'dept': r['worked_in_dept'] or 'Printing',
-                'location': 'Studio A',
                 'earnings': round(hours * rate, 2),
                 'currency': r['currency'] or 'GBP',
             })
