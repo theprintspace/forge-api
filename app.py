@@ -387,11 +387,143 @@ def login():
         release_conn(conn)
 
 
-@app.route('/api/freelancer/auth/reset-password', methods=['POST', 'OPTIONS'])
+@app.route('/api/freelancer/auth/reset-password', methods=['POST'])
 def reset_password():
-    if request.method == 'OPTIONS':
-        return '', 204
-    return jsonify({"message": "If that email exists, a reset link has been sent."})
+    import secrets, string
+    data = request.get_json() or {}
+    email = (data.get('email') or '').strip().lower()
+    if not email:
+        return jsonify({"message": "If an account exists, a reset email has been sent."})
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, full_name, email, branch_id FROM personnel "
+            "WHERE email = %s AND password_hash IS NOT NULL AND is_active = true",
+            (email,)
+        )
+        person = cur.fetchone()
+        if not person:
+            return jsonify({"message": "If an account exists, a reset email has been sent."})
+
+        # Generate temp password
+        temp_pw = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
+        pw_hash = bcrypt.hashpw(temp_pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cur.execute("UPDATE personnel SET password_hash = %s WHERE id = %s", (pw_hash, person['id']))
+
+        # Fetch template
+        branch_id = str(person['branch_id'] or '')
+        cur.execute(
+            "SELECT setting_value FROM roster_settings WHERE setting_key = 'email_template_password_reset' AND branch_id = %s",
+            (branch_id,)
+        )
+        tmpl_row = cur.fetchone()
+        first_name = (person['full_name'] or '').split(' ')[0] or 'there'
+        branch_email = BRANCH_EMAILS.get(branch_id, 'productionuk@theprintspace.co.uk')
+
+        subject = 'Your Forge password has been reset'
+        body_text = f'Hi {first_name}, your temporary password is: {temp_pw}\n\nLog in at {FORGE_APP_URL}/login'
+        cta_text = 'Log in to Forge'
+
+        if tmpl_row and tmpl_row['setting_value']:
+            val = tmpl_row['setting_value'] if isinstance(tmpl_row['setting_value'], dict) else _json.loads(tmpl_row['setting_value'])
+            subject = val.get('subject', subject).replace('[name]', first_name)
+            body_text = val.get('body', body_text).replace('[name]', first_name).replace('[temp_password]', temp_pw).replace('[Login URL]', FORGE_APP_URL + '/login')
+            cta_text = val.get('cta_text', cta_text)
+
+        html_body = f"""
+        <div style="font-family:'Inter',Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px 20px;">
+            <div style="text-align:center;margin-bottom:28px;">
+                <div style="display:inline-block;background:#1E2D18;border-radius:12px;padding:12px 16px;">
+                    <span style="color:#fff;font-size:22px;font-weight:700;">Forge</span>
+                </div>
+            </div>
+            <div style="font-size:14px;color:#5A6E50;line-height:1.6;white-space:pre-line;margin-bottom:24px;">
+                {body_text}
+            </div>
+            <div style="text-align:center;margin-bottom:28px;">
+                <a href="{FORGE_APP_URL}/login" style="display:inline-block;background:#4A6838;color:#fff;
+                    text-decoration:none;padding:14px 32px;border-radius:12px;font-size:15px;font-weight:600;">
+                    {cta_text}
+                </a>
+            </div>
+            <p style="font-size:11px;color:#B8C4B0;text-align:center;">theprintspace &middot; Forge</p>
+        </div>
+        """
+
+        try:
+            resend.Emails.send({
+                "from": "Forge <noreply@theprintspace.com>",
+                "to": [person['email']],
+                "reply_to": branch_email,
+                "subject": subject,
+                "html": html_body,
+            })
+        except Exception as e:
+            print(f"Reset email failed: {e}")
+
+        conn.commit()
+        return jsonify({"message": "If an account exists, a reset email has been sent."})
+    finally:
+        release_conn(conn)
+
+
+@app.route('/api/freelancer/admin/reset-password', methods=['POST'])
+def admin_reset_password():
+    import secrets, string
+    data = request.get_json() or {}
+    personnel_id = data.get('personnel_id')
+    if not personnel_id:
+        return jsonify({"error": "personnel_id required"}), 400
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, full_name, email, branch_id FROM personnel WHERE id = %s", (personnel_id,))
+        person = cur.fetchone()
+        if not person:
+            return jsonify({"error": "Not found"}), 404
+        if not person['email']:
+            return jsonify({"error": "No email on file"}), 400
+
+        temp_pw = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
+        pw_hash = bcrypt.hashpw(temp_pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cur.execute("UPDATE personnel SET password_hash = %s WHERE id = %s", (pw_hash, person['id']))
+
+        # Send email
+        branch_id = str(person['branch_id'] or '')
+        first_name = (person['full_name'] or '').split(' ')[0]
+        branch_email = BRANCH_EMAILS.get(branch_id, 'productionuk@theprintspace.co.uk')
+
+        try:
+            resend.Emails.send({
+                "from": "Forge <noreply@theprintspace.com>",
+                "to": [person['email']],
+                "reply_to": branch_email,
+                "subject": "Your Forge password has been reset",
+                "html": f"""
+                <div style="font-family:'Inter',Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px 20px;">
+                    <div style="text-align:center;margin-bottom:28px;">
+                        <div style="display:inline-block;background:#1E2D18;border-radius:12px;padding:12px 16px;">
+                            <span style="color:#fff;font-size:22px;font-weight:700;">Forge</span>
+                        </div>
+                    </div>
+                    <p style="font-size:14px;color:#5A6E50;line-height:1.6;">
+                        Hi {first_name}, your password has been reset by your manager.<br><br>
+                        Your new temporary password is: <b>{temp_pw}</b><br><br>
+                        Log in at <a href="{FORGE_APP_URL}/login">{FORGE_APP_URL}/login</a>
+                    </p>
+                </div>
+                """,
+            })
+        except Exception as e:
+            print(f"Admin reset email failed: {e}")
+
+        conn.commit()
+        return jsonify({"success": True, "email": person['email'], "temp_password": temp_pw})
+    finally:
+        release_conn(conn)
 
 
 # ── INVITE SYSTEM ──
