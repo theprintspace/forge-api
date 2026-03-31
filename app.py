@@ -892,6 +892,14 @@ def clock_scan():
         if not row or row['token'] != qr_token:
             return jsonify({"error": "Invalid QR code"}), 400
 
+        # Verify freelancer belongs to this branch
+        freelancer_branch = str(g.branch_id or '')
+        if qr_branch != freelancer_branch:
+            return jsonify({
+                'error': 'invalid_qr',
+                'message': 'This QR code is not for your branch. Scan the QR at your location.'
+            }), 403
+
         if qr_type == 'overtime':
             return _handle_overtime_scan(g.personnel_id, qr_branch, qr_dept)
 
@@ -913,13 +921,33 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             SELECT id, clock_in_at, clock_out_at, break_minutes, start_time, end_time
             FROM roster_entries
             WHERE personnel_id = %s AND shift_date = %s
-            AND booking_status IN ('booked', 'accepted')
+            AND booking_status IN ('booked', 'accepted', 'confirmed')
             LIMIT 1
         """, (personnel_id, today))
         entry = cur.fetchone()
 
+        # ── SHIFT ALREADY COMPLETED ──
+        if entry and entry['clock_in_at'] and entry['clock_out_at']:
+            return jsonify({
+                'error': 'shift_completed',
+                'message': 'Your shift is already completed for today. Contact your manager to adjust hours.'
+            }), 409
+
         # ── CLOCK IN: no roster entry exists ──
         if not entry:
+            # Guard: check for a completed entry that didn't match booking_status filter
+            cur.execute("""
+                SELECT id FROM roster_entries
+                WHERE personnel_id = %s AND shift_date = %s
+                AND clock_in_at IS NOT NULL AND clock_out_at IS NOT NULL
+                LIMIT 1
+            """, (personnel_id, today))
+            if cur.fetchone():
+                return jsonify({
+                    'error': 'shift_completed',
+                    'message': 'Your shift is already completed for today. Contact your manager to adjust hours.'
+                }), 409
+            shift_start, shift_end = get_default_shift_hours(cur, branch_id)
             cur.execute("""
                 INSERT INTO roster_entries (personnel_id, shift_date, branch_id, booking_status,
                     personnel_status, worked_in_dept, clock_in_at, start_time, end_time)
@@ -928,7 +956,6 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                 SET clock_in_at = EXCLUDED.clock_in_at, personnel_status = 'present',
                     worked_in_dept = EXCLUDED.worked_in_dept, booking_status = 'accepted'
                 RETURNING id
-            shift_start, shift_end = get_default_shift_hours(cur, branch_id)
             """, (personnel_id, today, branch_id, department, now, shift_start, shift_end))
             roster_id = cur.fetchone()['id']
 
@@ -964,9 +991,6 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             conn.commit()
             return jsonify({"action": "clocked_in", "department": department,
                             "time": now.strftime('%H:%M'), "clock_in_at": now.isoformat()})
-
-        if entry['clock_out_at']:
-            return jsonify({"error": "Already clocked out today"}), 400
 
         # ── CLOCK OUT: calculate hours ──
         clock_in = entry['clock_in_at']
@@ -1008,7 +1032,7 @@ def _handle_overtime_scan(personnel_id, branch_id, department):
             SELECT id, clock_in_at, clock_out_at, break_minutes
             FROM roster_entries
             WHERE personnel_id = %s AND shift_date = %s
-            AND booking_status IN ('booked', 'accepted')
+            AND booking_status IN ('booked', 'accepted', 'confirmed')
             AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
             LIMIT 1
         """, (personnel_id, today))
