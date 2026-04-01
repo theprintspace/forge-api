@@ -1189,7 +1189,14 @@ def break_end():
         ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
         break_number = 1
         if ce_id:
-            cur.execute("UPDATE clock_entries SET break_minutes = %s WHERE id = %s", (total_breaks, ce_id))
+            cur.execute("SELECT clock_in, clock_out FROM clock_entries WHERE id = %s", (ce_id,))
+            ce_row = cur.fetchone()
+            if ce_row and ce_row['clock_out']:
+                hw = max(0, (ce_row['clock_out'] - ce_row['clock_in']).total_seconds() / 3600 - total_breaks / 60)
+                cur.execute("UPDATE clock_entries SET break_minutes = %s, worked_hours = %s WHERE id = %s",
+                            (total_breaks, round(hw, 2), ce_id))
+            else:
+                cur.execute("UPDATE clock_entries SET break_minutes = %s WHERE id = %s", (total_breaks, ce_id))
             cur.execute("SELECT count(*) as cnt FROM clock_events WHERE clock_entry_id = %s AND event_type = 'break_end'", (ce_id,))
             break_number = (cur.fetchone()['cnt'] or 0) + 1
             _log_event(cur, ce_id, entry['id'], g.personnel_id, 'break_end',
