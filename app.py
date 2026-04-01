@@ -769,10 +769,13 @@ def get_today():
         # Determine clock status
         clock_status = "idle"
         clock_in_at = None
+        clock_out_at = None
         break_start_at = None
+        break_minutes = 0
         if today_shift:
             if today_shift.get('clock_in_at') and not today_shift.get('clock_out_at'):
                 clock_in_at = today_shift['clock_in_at'].isoformat() if today_shift['clock_in_at'] else None
+                break_minutes = today_shift.get('break_minutes') or 0
                 if today_shift.get('break_start_at'):
                     clock_status = "break"
                     break_start_at = today_shift['break_start_at'].isoformat()
@@ -780,12 +783,17 @@ def get_today():
                     clock_status = "clocked"
             elif today_shift.get('clock_out_at'):
                 clock_status = "completed"
+                clock_in_at = today_shift['clock_in_at'].isoformat() if today_shift['clock_in_at'] else None
+                clock_out_at = today_shift['clock_out_at'].isoformat()
+                break_minutes = today_shift.get('break_minutes') or 0
 
         return jsonify({
             "today": serialize(today_shift),
             "clock_status": clock_status,
             "clock_in_at": clock_in_at,
+            "clock_out_at": clock_out_at,
             "break_start_at": break_start_at,
+            "break_minutes": break_minutes,
             "upcoming": [serialize(s) for s in upcoming[:10]],
             "pending_offers": offers_count,
             "pay_per_hour": pay_per_hour,
@@ -913,7 +921,7 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT id, clock_in_at, clock_out_at, break_minutes, start_time, end_time
+            SELECT id, clock_in_at, clock_out_at, break_minutes, break_start_at, start_time, end_time
             FROM roster_entries
             WHERE personnel_id = %s AND shift_date = %s
             AND booking_status IN ('booked', 'accepted', 'confirmed')
@@ -987,30 +995,40 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             return jsonify({"action": "clocked_in", "department": department,
                             "time": now.strftime('%H:%M'), "clock_in_at": now.isoformat()})
 
-        # ── CLOCK OUT: calculate hours ──
+        # ── CLOCK OUT: auto-end break if active, then check hours ──
         clock_in = entry['clock_in_at']
-        breaks = entry['break_minutes'] or 0
+
+        # Auto-end break if freelancer is on break
+        if entry.get('break_start_at'):
+            break_duration = int((now - entry['break_start_at']).total_seconds() / 60)
+            breaks = (entry['break_minutes'] or 0) + break_duration
+            cur.execute("UPDATE roster_entries SET break_start_at = NULL, break_minutes = %s WHERE id = %s",
+                        (breaks, entry['id']))
+        else:
+            breaks = entry['break_minutes'] or 0
+
         elapsed_seconds = (now - clock_in).total_seconds() - (breaks * 60)
         hours_worked = elapsed_seconds / 3600
 
         if hours_worked < 8:
-            scheduled_end = str(entry['end_time'])[:5] if entry['end_time'] else '17:00'
+            conn.commit()  # commit break-end if it happened
             return jsonify({"action": "early_checkout", "hours_worked": round(hours_worked, 2),
-                            "scheduled_end": scheduled_end, "clock_in_at": clock_in.isoformat()})
-        else:
-            cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
-            ce_id = _get_active_clock_entry(cur, personnel_id, today)
-            if ce_id:
-                cur.execute("""
-                    UPDATE clock_entries SET clock_out = %s,
-                        worked_hours = %s, break_minutes = %s, status = 'pending_review'
-                    WHERE id = %s
-                """, (now, round(hours_worked, 2), breaks, ce_id))
-                _log_event(cur, ce_id, entry['id'], personnel_id, 'clock_out',
-                           metadata={"worked_hours": round(hours_worked, 2), "break_minutes": breaks})
-            conn.commit()
-            return jsonify({"action": "clocked_out", "hours_worked": round(hours_worked, 2),
-                            "time": now.strftime('%H:%M')})
+                            "clock_in_at": clock_in.isoformat(), "break_minutes": breaks})
+
+        cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
+        ce_id = _get_active_clock_entry(cur, personnel_id, today)
+        if ce_id:
+            cur.execute("""
+                UPDATE clock_entries SET clock_out = %s,
+                    worked_hours = %s, break_minutes = %s, status = 'pending_review'
+                WHERE id = %s
+            """, (now, round(hours_worked, 2), breaks, ce_id))
+            _log_event(cur, ce_id, entry['id'], personnel_id, 'clock_out',
+                       metadata={"worked_hours": round(hours_worked, 2), "break_minutes": breaks})
+        conn.commit()
+        return jsonify({"action": "clocked_out", "hours_worked": round(hours_worked, 2),
+                        "clock_in_at": clock_in.isoformat(), "clock_out_at": now.isoformat(),
+                        "break_minutes": breaks, "time": now.strftime('%H:%M')})
     finally:
         release_conn(conn)
 
@@ -1069,7 +1087,7 @@ def clock_force_out():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, clock_in_at, break_minutes FROM roster_entries
+            SELECT id, clock_in_at, break_minutes, break_start_at FROM roster_entries
             WHERE personnel_id = %s AND shift_date = %s
             AND clock_in_at IS NOT NULL AND clock_out_at IS NULL
             LIMIT 1
@@ -1079,7 +1097,15 @@ def clock_force_out():
         if not entry:
             return jsonify({"error": "No active clock-in found"}), 400
 
-        breaks = entry['break_minutes'] or 0
+        # Auto-end break if active
+        if entry.get('break_start_at'):
+            break_duration = int((now - entry['break_start_at']).total_seconds() / 60)
+            breaks = (entry['break_minutes'] or 0) + break_duration
+            cur.execute("UPDATE roster_entries SET break_start_at = NULL, break_minutes = %s WHERE id = %s",
+                        (breaks, entry['id']))
+        else:
+            breaks = entry['break_minutes'] or 0
+
         hours_worked = round(((now - entry['clock_in_at']).total_seconds() - breaks * 60) / 3600, 2)
 
         cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
@@ -1095,7 +1121,9 @@ def clock_force_out():
                        metadata={"worked_hours": hours_worked, "break_minutes": breaks, "reason": "early_checkout"})
 
         conn.commit()
-        return jsonify({"action": "clocked_out", "time": now.strftime('%H:%M')})
+        return jsonify({"action": "clocked_out", "hours_worked": hours_worked,
+                        "clock_in_at": entry['clock_in_at'].isoformat(), "clock_out_at": now.isoformat(),
+                        "break_minutes": breaks, "time": now.strftime('%H:%M')})
     finally:
         release_conn(conn)
 
@@ -1161,13 +1189,14 @@ def break_end():
         ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
         break_number = 1
         if ce_id:
+            cur.execute("UPDATE clock_entries SET break_minutes = %s WHERE id = %s", (total_breaks, ce_id))
             cur.execute("SELECT count(*) as cnt FROM clock_events WHERE clock_entry_id = %s AND event_type = 'break_end'", (ce_id,))
             break_number = (cur.fetchone()['cnt'] or 0) + 1
             _log_event(cur, ce_id, entry['id'], g.personnel_id, 'break_end',
                        metadata={"duration_minutes": break_duration, "break_number": break_number, "total_break_minutes": total_breaks})
 
         conn.commit()
-        return jsonify({"break_ended": now.strftime('%H:%M'), "break_minutes": break_duration, "total_break_minutes": total_breaks})
+        return jsonify({"status": "clocked", "break_ended": now.strftime('%H:%M'), "break_minutes": break_duration, "total_break_minutes": total_breaks})
     finally:
         release_conn(conn)
 
