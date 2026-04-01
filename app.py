@@ -869,27 +869,22 @@ def clock_scan():
     except Exception:
         return jsonify({"error": "Invalid QR code format"}), 400
 
-    qr_date = qr.get('date', '')
     qr_branch = qr.get('branch_id', '')
     qr_token = qr.get('token', '')
     qr_type = qr.get('type', 'clock')
     qr_dept = qr.get('department', 'Printing')
-    today = branch_today(getattr(g, 'branch_id', None))
 
-    if qr_date != today:
-        return jsonify({"error": "QR code expired — this code is for " + qr_date}), 400
-
-    # Validate token against daily_qr_tokens
+    # Validate token against daily_qr_tokens (no date check — QR codes are persistent)
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT token FROM daily_qr_tokens
-            WHERE branch_id = %s AND token_date = %s
-        """, (qr_branch, today))
+            SELECT id FROM daily_qr_tokens
+            WHERE branch_id = %s AND token = %s
+        """, (qr_branch, qr_token))
         row = cur.fetchone()
 
-        if not row or row['token'] != qr_token:
+        if not row:
             return jsonify({"error": "Invalid QR code"}), 400
 
         # Verify freelancer belongs to this branch
