@@ -11,7 +11,7 @@ import resend
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, request, jsonify, g
 import requests as http_requests
@@ -221,7 +221,7 @@ def _log_event(cur, clock_entry_id, roster_entry_id, personnel_id,
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"service": "forge-api", "status": "ok", "time": datetime.utcnow().isoformat()})
+    return jsonify({"service": "forge-api", "status": "ok", "time": datetime.now(timezone.utc).isoformat()})
 
 
 # ── CRON: Availability Reminder ──
@@ -370,7 +370,7 @@ def login():
             'email': user['email'],
             'branch_id': str(user['branch_id']) if user['branch_id'] else None,
             'role': 'freelancer',
-            'exp': datetime.utcnow() + timedelta(days=JWT_EXPIRY_DAYS),
+            'exp': datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRY_DAYS),
         }, JWT_SECRET, algorithm='HS256')
 
         return jsonify({
@@ -695,7 +695,7 @@ def set_password():
             'email': row['email'],
             'branch_id': str(row['branch_id']) if row['branch_id'] else None,
             'role': 'freelancer',
-            'exp': datetime.utcnow() + timedelta(days=JWT_EXPIRY_DAYS),
+            'exp': datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRY_DAYS),
         }, JWT_SECRET, algorithm='HS256')
 
         return jsonify({
@@ -914,7 +914,7 @@ def clock_scan():
 def _handle_clock_toggle(personnel_id, branch_id, department):
     """Toggle clock in/out based on current state. Writes to all 3 layers."""
     today = branch_today(getattr(g, 'branch_id', None))
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     conn = get_conn()
     try:
@@ -1036,7 +1036,7 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
 def _handle_overtime_scan(personnel_id, branch_id, department):
     """Handle overtime department QR scan."""
     today = branch_today(getattr(g, 'branch_id', None))
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     conn = get_conn()
     try:
@@ -1081,7 +1081,7 @@ def _handle_overtime_scan(personnel_id, branch_id, department):
 def clock_force_out():
     """Force clock out (early checkout confirmed by user)."""
     today = branch_today(getattr(g, 'branch_id', None))
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     conn = get_conn()
     try:
@@ -1132,7 +1132,7 @@ def clock_force_out():
 @require_auth
 def break_start():
     today = branch_today(getattr(g, 'branch_id', None))
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     conn = get_conn()
     try:
@@ -1166,7 +1166,7 @@ def break_start():
 @require_auth
 def break_end():
     today = branch_today(getattr(g, 'branch_id', None))
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     conn = get_conn()
     try:
