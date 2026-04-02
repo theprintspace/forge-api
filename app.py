@@ -958,11 +958,12 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             shift_start, shift_end = get_default_shift_hours(cur, branch_id)
             cur.execute("""
                 INSERT INTO roster_entries (personnel_id, shift_date, branch_id, booking_status,
-                    personnel_status, worked_in_dept, clock_in_at, start_time, end_time)
-                VALUES (%s, %s, %s, 'accepted', 'present', %s, %s, %s, %s)
+                    personnel_status, worked_in_dept, clock_in_at, start_time, end_time, break_minutes)
+                VALUES (%s, %s, %s, 'accepted', 'present', %s, %s, %s, %s, 0)
                 ON CONFLICT (personnel_id, shift_date) DO UPDATE
                 SET clock_in_at = EXCLUDED.clock_in_at, personnel_status = 'present',
-                    worked_in_dept = EXCLUDED.worked_in_dept, booking_status = 'accepted'
+                    worked_in_dept = EXCLUDED.worked_in_dept, booking_status = 'accepted',
+                    break_minutes = 0
                 RETURNING id
             """, (personnel_id, today, branch_id, department, now, shift_start, shift_end))
             roster_id = cur.fetchone()['id']
@@ -984,7 +985,7 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
         # ── CLOCK IN: roster entry exists, not clocked in yet ──
         if not entry['clock_in_at']:
             cur.execute("""
-                UPDATE roster_entries SET clock_in_at = %s, worked_in_dept = %s, personnel_status = 'present'
+                UPDATE roster_entries SET clock_in_at = %s, worked_in_dept = %s, personnel_status = 'present', break_minutes = 0
                 WHERE id = %s
             """, (now, department, entry['id']))
 
@@ -1022,7 +1023,8 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             return jsonify({"action": "early_checkout", "hours_worked": round(hours_worked, 2),
                             "clock_in_at": clock_in.isoformat(), "break_minutes": breaks})
 
-        cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
+        cur.execute("UPDATE roster_entries SET clock_out_at = %s, worked_hours = %s WHERE id = %s",
+                    (now, round(hours_worked, 2), entry['id']))
         local_now = to_branch_local(now, branch_id)
         ce_id = _get_active_clock_entry(cur, personnel_id, today)
         if ce_id:
@@ -1116,7 +1118,8 @@ def clock_force_out():
 
         hours_worked = round(((now - entry['clock_in_at']).total_seconds() - breaks * 60) / 3600, 2)
 
-        cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
+        cur.execute("UPDATE roster_entries SET clock_out_at = %s, worked_hours = %s WHERE id = %s",
+                    (now, hours_worked, entry['id']))
 
         local_now = to_branch_local(now, g.branch_id)
         ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
@@ -1192,8 +1195,12 @@ def break_end():
         break_duration = int((now - entry['break_start_at']).total_seconds() / 60)
         total_breaks = (entry['break_minutes'] or 0) + break_duration
 
-        cur.execute("UPDATE roster_entries SET break_start_at = NULL, break_minutes = %s WHERE id = %s",
-                    (total_breaks, entry['id']))
+        cur.execute("""UPDATE roster_entries SET break_start_at = NULL, break_minutes = %s,
+                    worked_hours = CASE WHEN clock_out_at IS NOT NULL
+                        THEN GREATEST(0, EXTRACT(EPOCH FROM (clock_out_at - clock_in_at)) / 3600.0 - %s::numeric / 60.0)
+                        ELSE worked_hours END
+                    WHERE id = %s""",
+                    (total_breaks, total_breaks, entry['id']))
 
         ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
         break_number = 1
@@ -1362,6 +1369,86 @@ def admin_push():
         if row and row['fcm_token']:
             send_push(row['fcm_token'], title, body, link)
         return jsonify({"success": True})
+    finally:
+        release_conn(conn)
+
+
+# ── ADMIN EDIT TIME (BigOps billing) ──
+
+ADMIN_GATEWAY_KEY = os.environ.get('ADMIN_GATEWAY_KEY', '')
+
+@app.route('/api/freelancer/admin/edit-time', methods=['POST', 'OPTIONS'])
+def admin_edit_time():
+    """Ops edits clock times from BigOps billing. Requires gateway key."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    # Auth: gateway key
+    gk = request.headers.get('x-gateway-key', '')
+    if not ADMIN_GATEWAY_KEY or gk != ADMIN_GATEWAY_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json() or {}
+    roster_entry_id = data.get('roster_entry_id')
+    clock_in_local = data.get('clock_in')      # "HH:MM" local time
+    clock_out_local = data.get('clock_out')     # "HH:MM" local time
+    break_mins = data.get('break_minutes')
+    bid = data.get('branch_id', '')
+    shift_date = data.get('shift_date', '')
+
+    if not roster_entry_id:
+        return jsonify({"error": "roster_entry_id required"}), 400
+
+    tz_name = BRANCH_TIMEZONES.get(str(bid), 'Europe/London')
+    tz = zoneinfo.ZoneInfo(tz_name)
+    utc_tz = zoneinfo.ZoneInfo('UTC')
+
+    def local_to_utc(time_str):
+        if not time_str or not shift_date:
+            return None
+        t = time_str if len(time_str) > 5 else time_str + ':00'
+        local_dt = datetime.strptime(f"{shift_date}T{t}", "%Y-%m-%dT%H:%M:%S").replace(tzinfo=tz)
+        return local_dt.astimezone(utc_tz)
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        # Fetch current values for fallback
+        cur.execute("SELECT clock_in_at, clock_out_at, break_minutes FROM roster_entries WHERE id = %s", (roster_entry_id,))
+        entry = cur.fetchone()
+        if not entry:
+            return jsonify({"error": "Entry not found"}), 404
+
+        new_in = local_to_utc(clock_in_local) if clock_in_local else entry['clock_in_at']
+        new_out = local_to_utc(clock_out_local) if clock_out_local else entry['clock_out_at']
+        new_break = break_mins if break_mins is not None else (entry['break_minutes'] or 0)
+
+        updates = {"updated_at": datetime.now(timezone.utc)}
+        if new_in:
+            updates["clock_in_at"] = new_in
+        if new_out:
+            updates["clock_out_at"] = new_out
+        updates["break_minutes"] = new_break
+
+        # Calculate worked_hours if both times exist
+        worked = None
+        if new_in and new_out:
+            worked = max(0, round((new_out - new_in).total_seconds() / 3600 - new_break / 60, 2))
+            updates["worked_hours"] = worked
+
+        set_clause = ', '.join(f"{k} = %s" for k in updates)
+        vals = list(updates.values()) + [roster_entry_id]
+        cur.execute(f"UPDATE roster_entries SET {set_clause} WHERE id = %s", vals)
+
+        conn.commit()
+        return jsonify({
+            "success": True,
+            "worked_hours": worked,
+            "clock_in_at": new_in.isoformat() if new_in else None,
+            "clock_out_at": new_out.isoformat() if new_out else None,
+            "break_minutes": new_break,
+        })
     finally:
         release_conn(conn)
 
