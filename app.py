@@ -57,6 +57,11 @@ def branch_today(branch_id):
     tz_name = BRANCH_TIMEZONES.get(str(branch_id or ''), 'Europe/London')
     return datetime.now(zoneinfo.ZoneInfo(tz_name)).strftime('%Y-%m-%d')
 
+def to_branch_local(utc_dt, branch_id):
+    """Convert UTC datetime to branch local time (naive — for clock_entries display)."""
+    tz_name = BRANCH_TIMEZONES.get(str(branch_id or ''), 'Europe/London')
+    return utc_dt.astimezone(zoneinfo.ZoneInfo(tz_name)).replace(tzinfo=None)
+
 FORGE_APP_URL = 'https://forge-app-sigma.vercel.app'
 def get_default_shift_hours(cur, branch_id):
     """Get default shift start/end from roster_settings for this branch."""
@@ -962,18 +967,19 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
             """, (personnel_id, today, branch_id, department, now, shift_start, shift_end))
             roster_id = cur.fetchone()['id']
 
+            local_now = to_branch_local(now, branch_id)
             cur.execute("""
                 INSERT INTO clock_entries (personnel_id, roster_entry_id, shift_date,
                     clock_in, department, branch_id, status)
                 VALUES (%s, %s, %s, %s, %s, %s, 'active')
                 RETURNING id
-            """, (personnel_id, roster_id, today, now, department, branch_id))
+            """, (personnel_id, roster_id, today, local_now, department, branch_id))
             ce_id = cur.fetchone()['id']
 
             _log_event(cur, ce_id, roster_id, personnel_id, 'clock_in', department)
             conn.commit()
             return jsonify({"action": "clocked_in", "department": department,
-                            "time": now.strftime('%H:%M'), "clock_in_at": now.isoformat()})
+                            "time": local_now.strftime('%H:%M'), "clock_in_at": local_now.isoformat()})
 
         # ── CLOCK IN: roster entry exists, not clocked in yet ──
         if not entry['clock_in_at']:
@@ -982,18 +988,19 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                 WHERE id = %s
             """, (now, department, entry['id']))
 
+            local_now = to_branch_local(now, branch_id)
             cur.execute("""
                 INSERT INTO clock_entries (personnel_id, roster_entry_id, shift_date,
                     clock_in, department, branch_id, status)
                 VALUES (%s, %s, %s, %s, %s, %s, 'active')
                 RETURNING id
-            """, (personnel_id, entry['id'], today, now, department, branch_id))
+            """, (personnel_id, entry['id'], today, local_now, department, branch_id))
             ce_id = cur.fetchone()['id']
 
             _log_event(cur, ce_id, entry['id'], personnel_id, 'clock_in', department)
             conn.commit()
             return jsonify({"action": "clocked_in", "department": department,
-                            "time": now.strftime('%H:%M'), "clock_in_at": now.isoformat()})
+                            "time": local_now.strftime('%H:%M'), "clock_in_at": local_now.isoformat()})
 
         # ── CLOCK OUT: auto-end break if active, then check hours ──
         clock_in = entry['clock_in_at']
@@ -1016,19 +1023,20 @@ def _handle_clock_toggle(personnel_id, branch_id, department):
                             "clock_in_at": clock_in.isoformat(), "break_minutes": breaks})
 
         cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
+        local_now = to_branch_local(now, branch_id)
         ce_id = _get_active_clock_entry(cur, personnel_id, today)
         if ce_id:
             cur.execute("""
                 UPDATE clock_entries SET clock_out = %s,
                     worked_hours = %s, break_minutes = %s, status = 'pending_review'
                 WHERE id = %s
-            """, (now, round(hours_worked, 2), breaks, ce_id))
+            """, (local_now, round(hours_worked, 2), breaks, ce_id))
             _log_event(cur, ce_id, entry['id'], personnel_id, 'clock_out',
                        metadata={"worked_hours": round(hours_worked, 2), "break_minutes": breaks})
         conn.commit()
         return jsonify({"action": "clocked_out", "hours_worked": round(hours_worked, 2),
-                        "clock_in_at": clock_in.isoformat(), "clock_out_at": now.isoformat(),
-                        "break_minutes": breaks, "time": now.strftime('%H:%M')})
+                        "clock_in_at": clock_in.isoformat(), "clock_out_at": local_now.isoformat(),
+                        "break_minutes": breaks, "time": local_now.strftime('%H:%M')})
     finally:
         release_conn(conn)
 
@@ -1110,20 +1118,21 @@ def clock_force_out():
 
         cur.execute("UPDATE roster_entries SET clock_out_at = %s WHERE id = %s", (now, entry['id']))
 
+        local_now = to_branch_local(now, g.branch_id)
         ce_id = _get_active_clock_entry(cur, g.personnel_id, today)
         if ce_id:
             cur.execute("""
                 UPDATE clock_entries SET clock_out = %s,
                     worked_hours = %s, break_minutes = %s, status = 'pending_review'
                 WHERE id = %s
-            """, (now, hours_worked, breaks, ce_id))
+            """, (local_now, hours_worked, breaks, ce_id))
             _log_event(cur, ce_id, entry['id'], g.personnel_id, 'force_out',
                        metadata={"worked_hours": hours_worked, "break_minutes": breaks, "reason": "early_checkout"})
 
         conn.commit()
         return jsonify({"action": "clocked_out", "hours_worked": hours_worked,
-                        "clock_in_at": entry['clock_in_at'].isoformat(), "clock_out_at": now.isoformat(),
-                        "break_minutes": breaks, "time": now.strftime('%H:%M')})
+                        "clock_in_at": entry['clock_in_at'].isoformat(), "clock_out_at": local_now.isoformat(),
+                        "break_minutes": breaks, "time": local_now.strftime('%H:%M')})
     finally:
         release_conn(conn)
 
